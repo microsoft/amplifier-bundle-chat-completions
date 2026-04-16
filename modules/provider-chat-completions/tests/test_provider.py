@@ -891,3 +891,159 @@ class TestMessageEdgeCases:
         assert result[0]["role"] == "tool"
         assert result[0]["tool_call_id"] == "call_xyz"
         assert result[0]["content"] == "result data"
+
+
+# ---------------------------------------------------------------------------
+# Observability events tests
+# ---------------------------------------------------------------------------
+
+
+class TestObservabilityEvents:
+    """Tests for llm:request and llm:response observability event emission."""
+
+    def _make_provider(self, coordinator=None):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "max_retries": "0",
+                "min_retry_delay": "0.01",
+                "max_retry_delay": "0.02",
+            },
+            coordinator=coordinator,
+        )
+
+    @pytest.mark.asyncio
+    async def test_llm_request_event_emitted(self):
+        """llm:request event is emitted before the API call with provider and model."""
+        provider = self._make_provider(coordinator=FakeCoordinator())
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="hello"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        hooks = provider.coordinator.hooks
+        request_events = [e for e in hooks.events if e[0] == "llm:request"]
+        assert len(request_events) >= 1, "llm:request event must be emitted"
+
+        _, payload = request_events[0]
+        assert "provider" in payload, "llm:request payload must have 'provider'"
+        assert "model" in payload, "llm:request payload must have 'model'"
+        assert payload["provider"] == "chat-completions"
+
+    @pytest.mark.asyncio
+    async def test_llm_response_event_emitted(self):
+        """llm:response event is emitted after successful response with provider, usage, duration_ms."""
+        provider = self._make_provider(coordinator=FakeCoordinator())
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="hello",
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        hooks = provider.coordinator.hooks
+        # Filter for non-error llm:response events
+        response_events = [
+            e
+            for e in hooks.events
+            if e[0] == "llm:response" and e[1].get("status") != "error"
+        ]
+        assert len(response_events) >= 1, "llm:response event must be emitted"
+
+        _, payload = response_events[0]
+        assert "provider" in payload, "llm:response payload must have 'provider'"
+        assert "usage" in payload, "llm:response payload must have 'usage'"
+        assert "duration_ms" in payload, "llm:response payload must have 'duration_ms'"
+        assert payload["provider"] == "chat-completions"
+        assert isinstance(payload["duration_ms"], float)
+
+    @pytest.mark.asyncio
+    async def test_events_skipped_when_no_hooks(self):
+        """No crash when coordinator is None — events are silently skipped."""
+        provider = self._make_provider(coordinator=None)
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="hello"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        # Must not raise even though coordinator is None
+        result = await provider.complete(request)
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# list_models() tests
+# ---------------------------------------------------------------------------
+
+
+class TestListModels:
+    """Tests for list_models(): dynamic model listing with graceful fallback."""
+
+    def _make_provider(self, model: str = "test-model"):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config={"model": model, "max_tokens": "4096"})
+
+    @pytest.mark.asyncio
+    async def test_returns_models_from_server(self):
+        """list_models() returns ModelInfo objects from the server's /v1/models endpoint."""
+        from amplifier_core.models import ModelInfo
+
+        provider = self._make_provider()
+
+        # Mock model object with id attribute
+        mock_model = MagicMock()
+        mock_model.id = "gemma26-long"
+
+        # Mock page with .data list
+        mock_page = MagicMock()
+        mock_page.data = [mock_model]
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=mock_page)
+        provider._client = mock_client
+
+        result = await provider.list_models()
+
+        assert len(result) >= 1
+        assert any(m.id == "gemma26-long" for m in result)
+        assert all(isinstance(m, ModelInfo) for m in result)
+
+    @pytest.mark.asyncio
+    async def test_returns_fallback_on_failure(self):
+        """list_models() returns fallback with configured model id on any exception."""
+        from amplifier_core.models import ModelInfo
+
+        provider = self._make_provider(model="my-configured-model")
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(side_effect=Exception("Connection failed"))
+        provider._client = mock_client
+
+        result = await provider.list_models()
+
+        assert len(result) == 1
+        assert isinstance(result[0], ModelInfo)
+        assert result[0].id == "my-configured-model"

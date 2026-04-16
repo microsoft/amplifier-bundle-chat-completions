@@ -7,6 +7,7 @@ making it available as the 'chat-completions' provider.
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import openai
@@ -24,7 +25,7 @@ from amplifier_core.llm_errors import (
     ProviderUnavailableError as KernelProviderUnavailableError,
 )
 from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
-from amplifier_core.models import ConfigField, ProviderInfo
+from amplifier_core.models import ConfigField, ModelInfo, ProviderInfo
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
@@ -66,6 +67,7 @@ class ChatCompletionsProvider:
         self._model: str = str(self.config.get("model", ""))
         self._client: openai.AsyncOpenAI | None = None
         self._timeout: float = float(self.config.get("timeout", 60))
+        self._max_tokens: int = int(self.config.get("max_tokens", 4096))
         self._max_retries: int = int(self.config.get("max_retries", 3))
         self._min_retry_delay: float = float(self.config.get("min_retry_delay", 1.0))
         self._max_retry_delay: float = float(self.config.get("max_retry_delay", 60.0))
@@ -190,6 +192,21 @@ class ChatCompletionsProvider:
 
         err.__cause__ = exc
         return err
+
+    async def _emit_event(self, name: str, payload: dict[str, Any]) -> None:
+        """Emit an observability event via the coordinator's hooks, if available.
+
+        Safely checks that self.coordinator is not None and has a hooks
+        attribute before delegating to coordinator.hooks.emit.  This allows
+        the provider to be used without a coordinator (e.g. in unit tests)
+        without crashing.
+
+        Args:
+            name: The event name (e.g. 'llm:request', 'llm:response').
+            payload: The event payload dict.
+        """
+        if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
+            await self.coordinator.hooks.emit(name, payload)
 
     async def _repair_tool_sequence(self, messages: list[Message]) -> list[Message]:
         """Detect orphaned tool calls and inject synthetic tool results.
@@ -441,6 +458,57 @@ class ChatCompletionsProvider:
             finish_reason=choice.finish_reason,
         )
 
+    def _ensure_client(self) -> openai.AsyncOpenAI:
+        """Return the AsyncOpenAI client, creating it lazily if not yet initialised.
+
+        Returns:
+            The AsyncOpenAI client instance.
+        """
+        if self._client is None:
+            client_kwargs: dict[str, Any] = {}
+            if self.config.get("api_key"):
+                client_kwargs["api_key"] = self.config["api_key"]
+            if self.config.get("base_url"):
+                client_kwargs["base_url"] = self.config["base_url"]
+            self._client = openai.AsyncOpenAI(**client_kwargs)
+        return self._client
+
+    async def list_models(self) -> list[ModelInfo]:
+        """Return a list of models available on the server.
+
+        Queries the server's ``/v1/models`` endpoint via the OpenAI-compatible
+        client.  Each model returned by the server is converted to a
+        :class:`~amplifier_core.models.ModelInfo`.  If the request fails for any
+        reason, a single fallback entry using the configured model name is
+        returned so that callers always receive at least one usable model.
+
+        Returns:
+            A list of :class:`~amplifier_core.models.ModelInfo` objects.  On
+            failure, returns a one-element list containing the configured model.
+        """
+        try:
+            response = await self._ensure_client().models.list()
+            return [
+                ModelInfo(
+                    id=model.id,
+                    display_name=model.id,
+                    context_window=0,
+                    max_output_tokens=self._max_tokens,
+                    capabilities=["tools", "streaming"],
+                )
+                for model in response.data
+            ]
+        except Exception as exc:
+            logger.warning("Failed to list models from server: %s", exc)
+            return [
+                ModelInfo(
+                    id=self._model,
+                    display_name=self._model,
+                    context_window=0,
+                    max_output_tokens=self._max_tokens,
+                )
+            ]
+
     async def complete(self, request: ChatRequest) -> ChatResponse:
         """Send a chat request and return a ChatResponse.
 
@@ -457,14 +525,8 @@ class ChatCompletionsProvider:
         Raises:
             KernelLLMError subclass on any provider failure.
         """
-        # Lazy-initialize the AsyncOpenAI client.
-        if self._client is None:
-            client_kwargs: dict[str, Any] = {}
-            if self.config.get("api_key"):
-                client_kwargs["api_key"] = self.config["api_key"]
-            if self.config.get("base_url"):
-                client_kwargs["base_url"] = self.config["base_url"]
-            self._client = openai.AsyncOpenAI(**client_kwargs)
+        # Ensure the AsyncOpenAI client is initialised before the retry loop.
+        self._ensure_client()
 
         messages = await self._repair_tool_sequence(request.messages)
         wire_messages = self._convert_messages_to_wire(messages)
@@ -495,6 +557,14 @@ class ChatCompletionsProvider:
                 )
 
         async def _single_attempt() -> ChatResponse:
+            start_time = time.monotonic()
+            await self._emit_event(
+                "llm:request",
+                {
+                    "provider": self.name,
+                    "model": self._model,
+                },
+            )
             try:
                 async with asyncio.timeout(self._timeout):
                     response = await self._client.chat.completions.create(  # type: ignore[union-attr]
@@ -503,9 +573,39 @@ class ChatCompletionsProvider:
                         tools=wire_tools,  # type: ignore[arg-type]
                         stream=False,
                     )
-                return self._build_response(response)
+                chat_response = self._build_response(response)
             except Exception as exc:
-                raise self._translate_error(exc) from exc
+                duration_ms = (time.monotonic() - start_time) * 1000
+                kernel_error = self._translate_error(exc)
+                await self._emit_event(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "status": "error",
+                        "duration_ms": duration_ms,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise kernel_error from exc
+
+            duration_ms = (time.monotonic() - start_time) * 1000
+            usage_dict: dict[str, Any] = {}
+            if chat_response.usage:
+                usage_dict = {
+                    "input_tokens": chat_response.usage.input_tokens,
+                    "output_tokens": chat_response.usage.output_tokens,
+                    "total_tokens": chat_response.usage.total_tokens,
+                }
+            await self._emit_event(
+                "llm:response",
+                {
+                    "provider": self.name,
+                    "usage": usage_dict,
+                    "duration_ms": duration_ms,
+                    "stop_reason": chat_response.finish_reason,
+                },
+            )
+            return chat_response
 
         return await retry_with_backoff(
             _single_attempt, config=retry_config, on_retry=_on_retry
