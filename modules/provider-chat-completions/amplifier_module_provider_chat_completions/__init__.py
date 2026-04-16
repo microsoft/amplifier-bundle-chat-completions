@@ -69,6 +69,7 @@ class ChatCompletionsProvider:
         self._max_retries: int = int(self.config.get("max_retries", 3))
         self._min_retry_delay: float = float(self.config.get("min_retry_delay", 1.0))
         self._max_retry_delay: float = float(self.config.get("max_retry_delay", 60.0))
+        self._repaired_tool_ids: set[str] = set()
 
     def _translate_error(self, exc: Exception) -> KernelLLMError:
         """Translate an OpenAI SDK exception to a kernel error type.
@@ -189,6 +190,80 @@ class ChatCompletionsProvider:
 
         err.__cause__ = exc
         return err
+
+    async def _repair_tool_sequence(self, messages: list[Message]) -> list[Message]:
+        """Detect orphaned tool calls and inject synthetic tool results.
+
+        Scans the message list for assistant messages containing ToolCallBlock
+        entries whose IDs have no corresponding tool-role result message.
+        For each orphaned ID that has not already been repaired, a synthetic
+        error result message is injected immediately after the assistant message.
+
+        Already-repaired IDs are tracked in ``self._repaired_tool_ids`` so
+        that repeated calls with the same messages do not produce duplicate
+        injections.
+
+        Emits a ``provider:tool_sequence_repaired`` event when at least one
+        repair is performed.
+
+        Args:
+            messages: Internal message list to inspect and (possibly) repair.
+
+        Returns:
+            The (possibly modified) message list with synthetic results injected.
+        """
+        # Collect all tool_call_ids that already have a matching result message.
+        existing_result_ids: set[str] = set()
+        for msg in messages:
+            if msg.role == "tool":
+                if msg.tool_call_id:
+                    existing_result_ids.add(msg.tool_call_id)
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if isinstance(block, ToolResultBlock):
+                            existing_result_ids.add(block.tool_call_id)
+
+        result: list[Message] = []
+        repaired_tool_ids: list[str] = []
+
+        for msg in messages:
+            result.append(msg)
+
+            # Only assistant messages can carry ToolCallBlocks.
+            if msg.role != "assistant" or not isinstance(msg.content, list):
+                continue
+
+            for block in msg.content:
+                if not isinstance(block, ToolCallBlock):
+                    continue
+                tool_id = block.id
+                if tool_id in existing_result_ids or tool_id in self._repaired_tool_ids:
+                    continue
+                # Orphaned tool call — inject a synthetic error result.
+                synthetic = Message(
+                    role="tool",
+                    tool_call_id=tool_id,
+                    content=(
+                        "[ERROR] Tool result missing - this tool call was not executed."
+                    ),
+                )
+                result.append(synthetic)
+                self._repaired_tool_ids.add(tool_id)
+                repaired_tool_ids.append(tool_id)
+
+        if repaired_tool_ids:
+            if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:tool_sequence_repaired",
+                    {
+                        "provider": self.name,
+                        "model": self._model,
+                        "repaired_count": len(repaired_tool_ids),
+                        "repaired_tool_ids": repaired_tool_ids,
+                    },
+                )
+
+        return result
 
     def _convert_messages_to_wire(
         self, messages: list[Message]
@@ -386,7 +461,8 @@ class ChatCompletionsProvider:
                 client_kwargs["base_url"] = self.config["base_url"]
             self._client = openai.AsyncOpenAI(**client_kwargs)
 
-        wire_messages = self._convert_messages_to_wire(request.messages)
+        messages = await self._repair_tool_sequence(request.messages)
+        wire_messages = self._convert_messages_to_wire(messages)
         wire_tools = (
             self._convert_tools_to_wire(request.tools) if request.tools else None
         )

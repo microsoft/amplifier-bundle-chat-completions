@@ -692,3 +692,111 @@ class TestRetry:
         assert "delay" in payload
         assert "error_type" in payload
         assert "error_message" in payload
+
+
+# ---------------------------------------------------------------------------
+# Tool repair tests
+# ---------------------------------------------------------------------------
+
+
+class TestToolRepair:
+    """Tests for _repair_tool_sequence: orphaned tool call detection and repair."""
+
+    def _make_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(
+            config={"model": "test-model"},
+            coordinator=FakeCoordinator(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_tool_result_is_repaired(self):
+        """Assistant message with ToolCallBlock but no matching tool result gets repaired."""
+        provider = self._make_provider()
+
+        messages = [
+            Message(role="user", content="Call a tool"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="call_1", name="my_func", input={})],
+            ),
+            # No tool result message follows
+        ]
+
+        result = await provider._repair_tool_sequence(messages)
+
+        # Should have injected a synthetic tool result after the assistant message
+        assert len(result) == 3
+        synthetic = result[2]
+        assert synthetic.role == "tool"
+        assert synthetic.tool_call_id == "call_1"
+        assert "[ERROR] Tool result missing" in str(synthetic.content)
+
+        # Verify repair event was emitted
+        events = provider.coordinator.hooks.events
+        repair_events = [e for e in events if e[0] == "provider:tool_sequence_repaired"]
+        assert len(repair_events) == 1
+        _, payload = repair_events[0]
+        assert payload["repaired_count"] == 1
+        assert "call_1" in payload["repaired_tool_ids"]
+        assert payload["provider"] == "chat-completions"
+        assert "model" in payload
+
+    @pytest.mark.asyncio
+    async def test_repaired_ids_not_detected_again(self):
+        """Already-repaired tool call IDs are not re-repaired on a second call."""
+        provider = self._make_provider()
+
+        messages = [
+            Message(role="user", content="Call a tool"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="call_1", name="my_func", input={})],
+            ),
+        ]
+
+        # First call repairs the orphaned call
+        result1 = await provider._repair_tool_sequence(messages)
+        assert len(result1) == 3
+
+        # Second call with the same original messages (still without tool result)
+        # should NOT re-repair because call_1 is already in _repaired_tool_ids
+        result2 = await provider._repair_tool_sequence(messages)
+        assert len(result2) == 2  # No additional injection
+
+        # Only 1 repair event total (emitted during first call only)
+        events = provider.coordinator.hooks.events
+        repair_events = [e for e in events if e[0] == "provider:tool_sequence_repaired"]
+        assert len(repair_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_missing_tool_results(self):
+        """Multiple orphaned tool calls in a single assistant message all get repaired."""
+        provider = self._make_provider()
+
+        messages = [
+            Message(role="user", content="Call tools"),
+            Message(
+                role="assistant",
+                content=[
+                    ToolCallBlock(id="call_1", name="func1", input={}),
+                    ToolCallBlock(id="call_2", name="func2", input={}),
+                    ToolCallBlock(id="call_3", name="func3", input={}),
+                ],
+            ),
+            # No tool results follow
+        ]
+
+        result = await provider._repair_tool_sequence(messages)
+
+        # 2 original messages + 3 injected synthetic tool results
+        assert len(result) == 5
+
+        # Verify the repair event
+        events = provider.coordinator.hooks.events
+        repair_events = [e for e in events if e[0] == "provider:tool_sequence_repaired"]
+        assert len(repair_events) == 1
+        _, payload = repair_events[0]
+        assert payload["repaired_count"] == 3
+        assert set(payload["repaired_tool_ids"]) == {"call_1", "call_2", "call_3"}
