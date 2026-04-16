@@ -283,7 +283,12 @@ class ChatCompletionsProvider:
         """
         wire: list[dict[str, Any]] = []
 
-        for message in messages:
+        # Prepend developer messages (as system) before user messages in wire format.
+        ordered = [m for m in messages if m.role == "developer"] + [
+            m for m in messages if m.role != "developer"
+        ]
+
+        for message in ordered:
             role = "system" if message.role == "developer" else message.role
             content = message.content
 

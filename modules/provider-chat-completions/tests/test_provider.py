@@ -22,6 +22,7 @@ import openai
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
+    ImageBlock,
     Message,
     TextBlock,
     ThinkingBlock,
@@ -800,3 +801,93 @@ class TestToolRepair:
         _, payload = repair_events[0]
         assert payload["repaired_count"] == 3
         assert set(payload["repaired_tool_ids"]) == {"call_1", "call_2", "call_3"}
+
+
+# ---------------------------------------------------------------------------
+# Message edge cases tests
+# ---------------------------------------------------------------------------
+
+
+class TestMessageEdgeCases:
+    """Tests for message conversion edge cases."""
+
+    def _get_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config={"model": "test-model"})
+
+    def test_developer_role_prepended_before_user(self):
+        """Developer message (converted to system) is prepended before user messages."""
+        provider = self._get_provider()
+        msgs = [
+            Message(role="user", content="Hello"),
+            Message(role="developer", content="You are a helpful assistant."),
+        ]
+        result = provider._convert_messages_to_wire(msgs)
+        # developer message should come first as system, before the user message
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "You are a helpful assistant."
+        assert result[1]["role"] == "user"
+        assert result[1]["content"] == "Hello"
+
+    def test_image_block_url_format(self):
+        """ImageBlock with base64 source produces correct data: URL format."""
+        provider = self._get_provider()
+        msgs = [
+            Message(
+                role="user",
+                content=[
+                    TextBlock(text="Look at this image"),
+                    ImageBlock(
+                        source={
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        }
+                    ),
+                ],
+            )
+        ]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        # Find the image_url item
+        image_items = [item for item in content if item["type"] == "image_url"]
+        assert len(image_items) == 1
+        assert image_items[0]["image_url"]["url"] == "data:image/png;base64,abc123"
+
+    def test_empty_content_string(self):
+        """Empty string content doesn't crash and passes through as empty string."""
+        provider = self._get_provider()
+        msgs = [Message(role="user", content="")]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == ""
+
+    def test_empty_content_list(self):
+        """Empty content list handles gracefully with the message still having correct role."""
+        provider = self._get_provider()
+        msgs = [Message(role="user", content=[])]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+
+    def test_tool_result_block_in_content(self):
+        """ToolResultBlock in content list produces role='tool' with correct tool_call_id."""
+        provider = self._get_provider()
+        msgs = [
+            Message(
+                role="tool",
+                content=[
+                    ToolResultBlock(tool_call_id="call_xyz", output="result data")
+                ],
+            )
+        ]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_xyz"
+        assert result[0]["content"] == "result data"
