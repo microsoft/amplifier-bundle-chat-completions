@@ -111,10 +111,13 @@ class ChatCompletionsProvider:
             str(self.config.get("base_url", "http://localhost:8080/v1")),
         )
 
-        # api_key: env var takes precedence over config, then empty string.
-        self._api_key: str = os.environ.get(
-            "CHAT_COMPLETIONS_API_KEY",
-            str(self.config.get("api_key", "")),
+        # api_key: env var takes precedence over config, then "not-needed".
+        # Empty string is rejected by the OpenAI client library, so we use
+        # "not-needed" as a safe placeholder for local/keyless deployments.
+        self._api_key: str = (
+            os.environ.get("CHAT_COMPLETIONS_API_KEY")
+            or self.config.get("api_key")
+            or "not-needed"
         )
 
         self._model: str = str(self.config.get("model", "default"))
@@ -729,7 +732,7 @@ class ChatCompletionsProvider:
                 )
             ]
 
-    async def complete(self, request: ChatRequest) -> ChatResponse:
+    async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
         """Send a chat request and return a ChatResponse.
 
         Lazily initialises the AsyncOpenAI client on the first call.  Wraps
@@ -829,6 +832,17 @@ class ChatCompletionsProvider:
         return await retry_with_backoff(
             _single_attempt, config=retry_config, on_retry=_on_retry
         )
+
+    def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
+        """Extract tool calls from a ChatResponse.
+
+        Args:
+            response: The ChatResponse returned by complete().
+
+        Returns:
+            The list of ToolCall objects, or an empty list if none present.
+        """
+        return response.tool_calls or []
 
     def get_info(self) -> ProviderInfo:
         """Return metadata describing this provider's capabilities and configuration.
@@ -946,7 +960,7 @@ class ChatCompletionsProvider:
                 pass
 
 
-async def mount(config: Any, coordinator: Any) -> Any:
+async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     """Mount the chat-completions provider into the coordinator.
 
     Creates a ChatCompletionsProvider instance, registers it with the
@@ -954,13 +968,13 @@ async def mount(config: Any, coordinator: Any) -> Any:
     succeeded, and returns a cleanup callable.
 
     Args:
-        config: Provider configuration object.
-        coordinator: Amplifier coordinator instance.
+        coordinator: Amplifier coordinator instance (first arg per amplifier-core convention).
+        config: Provider configuration dict, or None for defaults.
 
     Returns:
         An async cleanup function that closes the provider.
     """
-    provider = ChatCompletionsProvider(config, coordinator)
+    provider = ChatCompletionsProvider(config=config, coordinator=coordinator)
     await coordinator.mount("providers", provider, name="chat-completions")
     logger.info("chat-completions provider mounted")
 

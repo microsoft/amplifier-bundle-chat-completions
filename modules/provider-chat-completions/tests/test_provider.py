@@ -67,16 +67,33 @@ class TestMountContract:
 
     def test_mount_returns_coroutine(self):
         """mount() must return a coroutine when called."""
-        config = MagicMock()
         coordinator = MagicMock()
         coordinator.mount = AsyncMock()
+        config = {}
 
-        result = module.mount(config, coordinator)
+        result = module.mount(coordinator, config)
         assert asyncio.iscoroutine(result), (
             "mount() must be an async function that returns a coroutine"
         )
         # Clean up the coroutine to avoid RuntimeWarning
         result.close()
+
+    @pytest.mark.asyncio
+    async def test_mount_coordinator_is_first_arg(self):
+        """mount() must accept coordinator as its first positional argument.
+
+        amplifier-core calls mount(coordinator, config) — coordinator first.
+        """
+        coordinator = MagicMock()
+        coordinator.mount = AsyncMock()
+        config = {"model": "test-model"}
+
+        cleanup = await module.mount(coordinator, config)
+
+        # coordinator.mount(...) must have been called — proves coordinator was
+        # correctly bound as the first argument, not confused with config.
+        coordinator.mount.assert_called_once()
+        assert callable(cleanup)
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +713,121 @@ class TestRetry:
 
 
 # ---------------------------------------------------------------------------
+# complete() **kwargs tests
+# ---------------------------------------------------------------------------
+
+
+class TestCompleteKwargs:
+    """Verify complete() accepts **kwargs for forward-compatibility."""
+
+    @pytest.mark.asyncio
+    async def test_complete_accepts_extended_thinking_kwarg(self):
+        """complete() must accept extended_thinking=... without raising TypeError.
+
+        The orchestrator passes extended_thinking as a keyword argument.
+        """
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "use_streaming": "false",
+                "max_retries": "0",
+            }
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="hello"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        # Must not raise TypeError for unexpected keyword argument
+        result = await provider.complete(request, extended_thinking=True)
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_complete_accepts_arbitrary_kwargs(self):
+        """complete() must accept any **kwargs without raising TypeError."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "use_streaming": "false",
+                "max_retries": "0",
+            }
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="hello"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        result = await provider.complete(request, foo="bar", baz=42)
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# parse_tool_calls() tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseToolCalls:
+    """Verify parse_tool_calls() method exists and returns tool_calls."""
+
+    def _get_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config={"model": "test-model"})
+
+    def test_parse_tool_calls_method_exists(self):
+        """parse_tool_calls() method must exist on ChatCompletionsProvider."""
+        provider = self._get_provider()
+        assert hasattr(provider, "parse_tool_calls"), (
+            "ChatCompletionsProvider must have a parse_tool_calls() method"
+        )
+        assert callable(provider.parse_tool_calls)
+
+    def test_parse_tool_calls_returns_tool_calls_list(self):
+        """parse_tool_calls() returns the tool_calls list from a ChatResponse."""
+        from amplifier_core.message_models import ToolCall
+
+        provider = self._get_provider()
+        tool_calls = [ToolCall(id="call_1", name="my_func", arguments={"key": "val"})]
+        response = ChatResponse(content=[], tool_calls=tool_calls)
+
+        result = provider.parse_tool_calls(response)
+
+        assert result == tool_calls
+
+    def test_parse_tool_calls_returns_empty_list_when_none(self):
+        """parse_tool_calls() returns [] when ChatResponse.tool_calls is None."""
+        provider = self._get_provider()
+        response = ChatResponse(content=[], tool_calls=None)
+
+        result = provider.parse_tool_calls(response)
+
+        assert result == []
+
+    def test_parse_tool_calls_returns_empty_list_when_empty(self):
+        """parse_tool_calls() returns [] when ChatResponse.tool_calls is empty."""
+        provider = self._get_provider()
+        response = ChatResponse(content=[], tool_calls=[])
+
+        result = provider.parse_tool_calls(response)
+
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
 # Tool repair tests
 # ---------------------------------------------------------------------------
 
@@ -1206,9 +1338,13 @@ class TestConfigParsing:
         assert provider._api_key == "env-secret-key"
 
     def test_empty_api_key_default(self):
-        """api_key defaults to empty string when not set in config or env."""
+        """api_key defaults to 'not-needed' when not set in config or env.
+
+        Empty string is rejected by the OpenAI client library, so we use
+        'not-needed' as the safe placeholder for local/keyless deployments.
+        """
         provider = self._make_provider()
-        assert provider._api_key == ""
+        assert provider._api_key == "not-needed"
 
     def test_model_required_fallback(self):
         """model defaults to 'default' sentinel when not in config."""
