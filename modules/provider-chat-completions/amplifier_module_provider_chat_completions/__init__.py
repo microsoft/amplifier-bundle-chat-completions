@@ -23,6 +23,7 @@ from amplifier_core.llm_errors import (
     ProviderUnavailableError as KernelProviderUnavailableError,
 )
 from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
+from amplifier_core.models import ConfigField, ProviderInfo
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
@@ -400,11 +401,120 @@ class ChatCompletionsProvider:
         except Exception as exc:
             raise self._translate_error(exc) from exc
 
+    def get_info(self) -> ProviderInfo:
+        """Return metadata describing this provider's capabilities and configuration.
+
+        Returns:
+            A ProviderInfo instance with the provider's id, display name,
+            credential environment variables, capabilities, defaults, and
+            all 10 config field declarations.
+        """
+        return ProviderInfo(
+            id="chat-completions",
+            display_name="Chat Completions",
+            credential_env_vars=["CHAT_COMPLETIONS_API_KEY"],
+            capabilities=["tools", "streaming", "json_mode"],
+            defaults={
+                "model": self._model,
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "timeout": 300.0,
+            },
+            config_fields=[
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    field_type="secret",
+                    prompt="Enter your API key",
+                    env_var="CHAT_COMPLETIONS_API_KEY",
+                    required=False,
+                ),
+                ConfigField(
+                    id="base_url",
+                    display_name="Base URL",
+                    field_type="text",
+                    prompt="Enter the API base URL",
+                    env_var="CHAT_COMPLETIONS_BASE_URL",
+                    required=False,
+                    default="http://localhost:8080/v1",
+                ),
+                ConfigField(
+                    id="model",
+                    display_name="Model",
+                    field_type="text",
+                    prompt="Enter the model name to use",
+                    required=False,
+                ),
+                ConfigField(
+                    id="max_tokens",
+                    display_name="Max Tokens",
+                    field_type="text",
+                    prompt="Maximum number of tokens to generate",
+                    required=False,
+                    default="4096",
+                ),
+                ConfigField(
+                    id="temperature",
+                    display_name="Temperature",
+                    field_type="text",
+                    prompt="Sampling temperature (0.0-2.0)",
+                    required=False,
+                    default="0.7",
+                ),
+                ConfigField(
+                    id="timeout",
+                    display_name="Timeout",
+                    field_type="text",
+                    prompt="Request timeout in seconds",
+                    required=False,
+                    default="300.0",
+                ),
+                ConfigField(
+                    id="max_retries",
+                    display_name="Max Retries",
+                    field_type="text",
+                    prompt="Maximum number of retry attempts",
+                    required=False,
+                    default="3",
+                ),
+                ConfigField(
+                    id="min_retry_delay",
+                    display_name="Min Retry Delay",
+                    field_type="text",
+                    prompt="Minimum delay between retries in seconds",
+                    required=False,
+                    default="1.0",
+                ),
+                ConfigField(
+                    id="max_retry_delay",
+                    display_name="Max Retry Delay",
+                    field_type="text",
+                    prompt="Maximum delay between retries in seconds",
+                    required=False,
+                    default="60.0",
+                ),
+                ConfigField(
+                    id="use_streaming",
+                    display_name="Use Streaming",
+                    field_type="boolean",
+                    prompt="Enable streaming responses",
+                    required=False,
+                    default="false",
+                ),
+            ],
+        )
+
     async def close(self) -> None:
-        """Release any resources held by this provider."""
+        """Release any resources held by this provider.
+
+        Uses asyncio.shield so the client cleanup completes even if the
+        enclosing task is cancelled.  All exceptions are suppressed.
+        """
         if self._client is not None:
-            await self._client.close()
-            self._client = None
+            try:
+                await asyncio.shield(self._client.close())
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 async def mount(config: Any, coordinator: Any) -> Any:

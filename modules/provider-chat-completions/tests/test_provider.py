@@ -7,10 +7,13 @@ Tests verify:
 - Error translation from OpenAI SDK exceptions to kernel error types
 - Message conversion (inbound: messages -> wire format)
 - Response building (outbound: API response -> ChatResponse)
+- get_info() returns ProviderInfo with correct fields
+- close() works safely with and without a client initialized
 """
 
 import asyncio
 import json
+import pytest
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -461,3 +464,119 @@ class TestMessageConversionOutbound:
         text_blocks = [b for b in result.content if isinstance(b, TextBlock)]
         assert len(text_blocks) == 1
         assert text_blocks[0].text == "The answer is 42."
+
+
+# ---------------------------------------------------------------------------
+# get_info() tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetInfo:
+    """Verify get_info() returns a correctly populated ProviderInfo."""
+
+    def _get_provider(self, model="gpt-4o"):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config={"model": model})
+
+    def test_returns_provider_info(self):
+        """get_info() returns a ProviderInfo instance."""
+        from amplifier_core.models import ProviderInfo
+
+        provider = self._get_provider()
+        info = provider.get_info()
+        assert isinstance(info, ProviderInfo)
+
+    def test_provider_id(self):
+        """ProviderInfo.id must be 'chat-completions'."""
+        provider = self._get_provider()
+        info = provider.get_info()
+        assert info.id == "chat-completions"
+
+    def test_credential_env_vars(self):
+        """credential_env_vars must include 'CHAT_COMPLETIONS_API_KEY'."""
+        provider = self._get_provider()
+        info = provider.get_info()
+        assert "CHAT_COMPLETIONS_API_KEY" in info.credential_env_vars
+
+    def test_has_all_config_fields(self):
+        """All 10 config fields must be present."""
+        expected_field_ids = {
+            "api_key",
+            "base_url",
+            "model",
+            "max_tokens",
+            "temperature",
+            "timeout",
+            "max_retries",
+            "min_retry_delay",
+            "max_retry_delay",
+            "use_streaming",
+        }
+        provider = self._get_provider()
+        info = provider.get_info()
+        actual_ids = {field.id for field in info.config_fields}
+        assert expected_field_ids == actual_ids
+
+    def test_base_url_has_env_var(self):
+        """The base_url config field must have env_var='CHAT_COMPLETIONS_BASE_URL'."""
+        provider = self._get_provider()
+        info = provider.get_info()
+        base_url_field = next(
+            (f for f in info.config_fields if f.id == "base_url"), None
+        )
+        assert base_url_field is not None
+        assert base_url_field.env_var == "CHAT_COMPLETIONS_BASE_URL"
+
+    def test_api_key_is_secret_type(self):
+        """The api_key config field must have field_type='secret'."""
+        provider = self._get_provider()
+        info = provider.get_info()
+        api_key_field = next((f for f in info.config_fields if f.id == "api_key"), None)
+        assert api_key_field is not None
+        assert api_key_field.field_type == "secret"
+
+    def test_defaults_include_model(self):
+        """The defaults dict must include 'model' key matching self._model."""
+        provider = self._get_provider(model="my-model")
+        info = provider.get_info()
+        assert "model" in info.defaults
+        assert info.defaults["model"] == "my-model"
+
+    def test_capabilities_include_tools_and_streaming(self):
+        """capabilities must include 'tools' and 'streaming'."""
+        provider = self._get_provider()
+        info = provider.get_info()
+        assert "tools" in info.capabilities
+        assert "streaming" in info.capabilities
+
+
+# ---------------------------------------------------------------------------
+# close() tests
+# ---------------------------------------------------------------------------
+
+
+class TestClose:
+    """Verify close() works safely with and without a client initialized."""
+
+    def test_close_with_no_client_does_not_raise(self):
+        """close() must not raise when _client is None."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={})
+        assert provider._client is None
+        # Should not raise
+        asyncio.run(provider.close())
+
+    @pytest.mark.asyncio
+    async def test_close_calls_client_close(self):
+        """close() must call _client.close() when client is initialized."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={})
+        mock_client = AsyncMock()
+        provider._client = mock_client
+
+        await provider.close()
+
+        mock_client.close.assert_called_once()
