@@ -1163,3 +1163,79 @@ class TestStreaming:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "grep"
         assert result.tool_calls[0].arguments == {"pattern": "test"}
+
+
+# ---------------------------------------------------------------------------
+# Config parsing tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigParsing:
+    """Tests for __init__ config parsing: defaults, env var fallbacks, and type coercion."""
+
+    def _make_provider(self, config=None):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config=config or {})
+
+    def test_default_base_url(self):
+        """base_url defaults to 'http://localhost:8080/v1' when not set."""
+        provider = self._make_provider()
+        assert provider._base_url == "http://localhost:8080/v1"
+
+    def test_custom_base_url(self):
+        """base_url from config overrides the default."""
+        provider = self._make_provider(config={"base_url": "http://myserver:9000/v1"})
+        assert provider._base_url == "http://myserver:9000/v1"
+
+    def test_base_url_from_env(self, monkeypatch):
+        """CHAT_COMPLETIONS_BASE_URL env var overrides config base_url."""
+        monkeypatch.setenv("CHAT_COMPLETIONS_BASE_URL", "http://env-server:1234/v1")
+        provider = self._make_provider(config={"base_url": "http://config-server/v1"})
+        assert provider._base_url == "http://env-server:1234/v1"
+
+    def test_api_key_from_env(self, monkeypatch):
+        """CHAT_COMPLETIONS_API_KEY env var overrides config api_key."""
+        monkeypatch.setenv("CHAT_COMPLETIONS_API_KEY", "env-secret-key")
+        provider = self._make_provider(config={"api_key": "config-key"})
+        assert provider._api_key == "env-secret-key"
+
+    def test_empty_api_key_default(self):
+        """api_key defaults to empty string when not set in config or env."""
+        provider = self._make_provider()
+        assert provider._api_key == ""
+
+    def test_model_required_fallback(self):
+        """model defaults to 'default' sentinel when not in config."""
+        provider = self._make_provider()
+        assert provider._model == "default"
+
+    def test_model_from_config(self):
+        """model is taken from config when provided."""
+        provider = self._make_provider(config={"model": "my-custom-model"})
+        assert provider._model == "my-custom-model"
+
+    def test_default_max_tokens(self):
+        """max_tokens defaults to 4096."""
+        provider = self._make_provider()
+        assert provider._max_tokens == 4096
+
+    def test_default_temperature(self):
+        """temperature defaults to 0.7."""
+        provider = self._make_provider()
+        assert provider._temperature == 0.7
+
+    def test_default_timeout(self):
+        """timeout defaults to 300.0."""
+        provider = self._make_provider()
+        assert provider._timeout == 300.0
+
+    def test_use_streaming_default_true(self):
+        """use_streaming defaults to True when not set."""
+        provider = self._make_provider()
+        assert provider._use_streaming is True
+
+    def test_use_streaming_false(self):
+        """use_streaming string 'false' coerces to False bool."""
+        provider = self._make_provider(config={"use_streaming": "false"})
+        assert provider._use_streaming is False

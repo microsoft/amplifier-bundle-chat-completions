@@ -7,6 +7,7 @@ making it available as the 'chat-completions' provider.
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -51,6 +52,45 @@ class ChatCompletionsProvider:
 
     name = "chat-completions"
 
+    @staticmethod
+    def _config_bool(value: Any) -> bool:
+        """Parse config booleans from YAML or CLI string values."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _config_int(value: Any, default: int) -> int:
+        """Parse an int config value with a safe fallback."""
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[PROVIDER] Invalid integer config value %r; using default %s",
+                value,
+                default,
+            )
+            return default
+
+    @staticmethod
+    def _config_float(value: Any, default: float) -> float:
+        """Parse a float config value with a safe fallback."""
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[PROVIDER] Invalid float config value %r; using default %s",
+                value,
+                default,
+            )
+            return default
+
     def __init__(
         self,
         config: dict[str, Any] | None = None,
@@ -64,19 +104,41 @@ class ChatCompletionsProvider:
         """
         self.config = config or {}
         self.coordinator = coordinator
-        self._model: str = str(self.config.get("model", ""))
+
+        # base_url: env var takes precedence over config, then default.
+        self._base_url: str = os.environ.get(
+            "CHAT_COMPLETIONS_BASE_URL",
+            str(self.config.get("base_url", "http://localhost:8080/v1")),
+        )
+
+        # api_key: env var takes precedence over config, then empty string.
+        self._api_key: str = os.environ.get(
+            "CHAT_COMPLETIONS_API_KEY",
+            str(self.config.get("api_key", "")),
+        )
+
+        self._model: str = str(self.config.get("model", "default"))
         self._client: openai.AsyncOpenAI | None = None
-        self._timeout: float = float(self.config.get("timeout", 60))
-        self._max_tokens: int = int(self.config.get("max_tokens", 4096))
-        self._max_retries: int = int(self.config.get("max_retries", 3))
-        self._min_retry_delay: float = float(self.config.get("min_retry_delay", 1.0))
-        self._max_retry_delay: float = float(self.config.get("max_retry_delay", 60.0))
+        self._timeout: float = self._config_float(
+            self.config.get("timeout", 300.0), 300.0
+        )
+        self._temperature: float = self._config_float(
+            self.config.get("temperature", 0.7), 0.7
+        )
+        self._max_tokens: int = self._config_int(
+            self.config.get("max_tokens", 4096), 4096
+        )
+        self._max_retries: int = self._config_int(self.config.get("max_retries", 3), 3)
+        self._min_retry_delay: float = self._config_float(
+            self.config.get("min_retry_delay", 1.0), 1.0
+        )
+        self._max_retry_delay: float = self._config_float(
+            self.config.get("max_retry_delay", 30.0), 30.0
+        )
         self._repaired_tool_ids: set[str] = set()
-        use_streaming = self.config.get("use_streaming", False)
-        if isinstance(use_streaming, bool):
-            self._use_streaming: bool = use_streaming
-        else:
-            self._use_streaming = str(use_streaming).lower() in ("true", "1", "yes")
+        self._use_streaming: bool = self._config_bool(
+            self.config.get("use_streaming", True)
+        )
 
     def _translate_error(self, exc: Exception) -> KernelLLMError:
         """Translate an OpenAI SDK exception to a kernel error type.
@@ -624,10 +686,10 @@ class ChatCompletionsProvider:
         """
         if self._client is None:
             client_kwargs: dict[str, Any] = {}
-            if self.config.get("api_key"):
-                client_kwargs["api_key"] = self.config["api_key"]
-            if self.config.get("base_url"):
-                client_kwargs["base_url"] = self.config["base_url"]
+            if self._api_key:
+                client_kwargs["api_key"] = self._api_key
+            if self._base_url:
+                client_kwargs["base_url"] = self._base_url
             self._client = openai.AsyncOpenAI(**client_kwargs)
         return self._client
 
