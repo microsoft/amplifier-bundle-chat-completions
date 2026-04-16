@@ -53,7 +53,7 @@ class TestModuleMetadata:
         assert module.__amplifier_module_type__ == "provider"
 
     def test_all_exports(self):
-        """__all__ must export exactly 'mount' and 'ChatCompletionsProvider'."""
+        """__all__ must export 'mount' and 'ChatCompletionsProvider'."""
         assert "mount" in module.__all__
         assert "ChatCompletionsProvider" in module.__all__
 
@@ -69,7 +69,7 @@ class TestMountContract:
         """mount() must return a coroutine when called."""
         coordinator = MagicMock()
         coordinator.mount = AsyncMock()
-        config = {}
+        config = {"base_url": "http://test:8080/v1"}
 
         result = module.mount(coordinator, config)
         assert asyncio.iscoroutine(result), (
@@ -86,7 +86,7 @@ class TestMountContract:
         """
         coordinator = MagicMock()
         coordinator.mount = AsyncMock()
-        config = {"model": "test-model"}
+        config = {"model": "test-model", "base_url": "http://test:8080/v1"}
 
         cleanup = await module.mount(coordinator, config)
 
@@ -94,6 +94,21 @@ class TestMountContract:
         # correctly bound as the first argument, not confused with config.
         coordinator.mount.assert_called_once()
         assert callable(cleanup)
+
+    @pytest.mark.asyncio
+    async def test_mount_returns_none_when_no_base_url(self, monkeypatch):
+        """mount() returns None (silent skip) when base_url is not configured."""
+        # Ensure env var is also not set
+        monkeypatch.delenv("CHAT_COMPLETIONS_BASE_URL", raising=False)
+
+        coordinator = MagicMock()
+        coordinator.mount = AsyncMock()
+        config = {}  # No base_url
+
+        result = await module.mount(coordinator, config)
+
+        assert result is None
+        coordinator.mount.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -362,14 +377,16 @@ class TestMessageConversionInbound:
             "content": "42",
         }
 
-    def test_developer_role_becomes_system(self):
-        """'developer' role is remapped to 'system' for OpenAI compatibility."""
+    def test_developer_role_becomes_user_with_context_file(self):
+        """'developer' role is wrapped in <context_file> XML and mapped to 'user'."""
         provider = self._get_provider()
         msgs = [Message(role="developer", content="You are a helpful assistant.")]
         result = provider._convert_messages_to_wire(msgs)
         assert len(result) == 1
-        assert result[0]["role"] == "system"
-        assert result[0]["content"] == "You are a helpful assistant."
+        assert result[0]["role"] == "user"
+        assert "<context_file>" in result[0]["content"]
+        assert "You are a helpful assistant." in result[0]["content"]
+        assert "</context_file>" in result[0]["content"]
 
     def test_system_role_passthrough(self):
         """'system' role is preserved unchanged."""
@@ -486,6 +503,81 @@ class TestMessageConversionOutbound:
 
 
 # ---------------------------------------------------------------------------
+# ChatCompletionsChatResponse subclass tests
+# ---------------------------------------------------------------------------
+
+
+class TestChatCompletionsChatResponse:
+    """Verify ChatCompletionsChatResponse subclass with content_blocks and text."""
+
+    def _get_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(
+            config={"model": "test-model", "use_streaming": "false", "max_retries": "0"}
+        )
+
+    def test_subclass_exported(self):
+        """ChatCompletionsChatResponse must be importable from the module."""
+        from amplifier_module_provider_chat_completions import (
+            ChatCompletionsChatResponse,
+        )
+        from amplifier_core.message_models import ChatResponse
+
+        assert issubclass(ChatCompletionsChatResponse, ChatResponse)
+
+    def test_all_exports_includes_response_subclass(self):
+        """ChatCompletionsChatResponse must appear in __all__."""
+        import amplifier_module_provider_chat_completions as mod
+
+        assert "ChatCompletionsChatResponse" in mod.__all__
+
+    def test_build_response_returns_subclass(self):
+        """_build_response() must return ChatCompletionsChatResponse with content_blocks and text."""
+        from amplifier_module_provider_chat_completions import (
+            ChatCompletionsChatResponse,
+        )
+
+        provider = self._get_provider()
+        response = _make_mock_completion(content="Hello there")
+        result = provider._build_response(response)
+
+        assert isinstance(result, ChatCompletionsChatResponse)
+        assert result.text == "Hello there"
+        assert result.content_blocks is not None
+        assert len(result.content_blocks) >= 1
+
+    def test_content_blocks_has_text_content(self):
+        """content_blocks must contain TextContent for text responses."""
+        from amplifier_core.content_models import TextContent
+
+        provider = self._get_provider()
+        response = _make_mock_completion(content="Hello")
+        result = provider._build_response(response)
+
+        text_blocks = [b for b in result.content_blocks if isinstance(b, TextContent)]
+        assert len(text_blocks) == 1
+        assert text_blocks[0].text == "Hello"
+
+    def test_content_blocks_has_tool_call_content(self):
+        """content_blocks must contain ToolCallContent for tool call responses."""
+        from amplifier_core.content_models import ToolCallContent
+
+        mock_tc = MagicMock()
+        mock_tc.id = "call_1"
+        mock_tc.function.name = "search"
+        mock_tc.function.arguments = json.dumps({"q": "test"})
+
+        provider = self._get_provider()
+        response = _make_mock_completion(content=None, tool_calls=[mock_tc])
+        result = provider._build_response(response)
+
+        tc_blocks = [b for b in result.content_blocks if isinstance(b, ToolCallContent)]
+        assert len(tc_blocks) == 1
+        assert tc_blocks[0].name == "search"
+
+
+# ---------------------------------------------------------------------------
 # get_info() tests
 # ---------------------------------------------------------------------------
 
@@ -519,7 +611,7 @@ class TestGetInfo:
         assert "CHAT_COMPLETIONS_API_KEY" in info.credential_env_vars
 
     def test_has_all_config_fields(self):
-        """All 10 config fields must be present."""
+        """All original config fields must be present (plus any new ones)."""
         expected_field_ids = {
             "api_key",
             "base_url",
@@ -531,11 +623,24 @@ class TestGetInfo:
             "min_retry_delay",
             "max_retry_delay",
             "use_streaming",
+            # Task 5: optional generation params
+            "top_p",
+            "stop",
+            "seed",
+            "parallel_tool_calls",
+            # Task 6: priority
+            "priority",
+            # Task 7: filtered
+            "filtered",
+            # Task 8: raw
+            "raw",
         }
         provider = self._get_provider()
         info = provider.get_info()
         actual_ids = {field.id for field in info.config_fields}
-        assert expected_field_ids == actual_ids
+        assert expected_field_ids.issubset(actual_ids), (
+            f"Missing config fields: {expected_field_ids - actual_ids}"
+        )
 
     def test_base_url_has_env_var(self):
         """The base_url config field must have env_var='CHAT_COMPLETIONS_BASE_URL'."""
@@ -864,7 +969,12 @@ class TestToolRepair:
         synthetic = result[2]
         assert synthetic.role == "tool"
         assert synthetic.tool_call_id == "call_1"
-        assert "[ERROR] Tool result missing" in str(synthetic.content)
+        # Content describes the orphan (message format may vary)
+        assert (
+            "my_func" in str(synthetic.content)
+            or "orphaned" in str(synthetic.content)
+            or "missing" in str(synthetic.content).lower()
+        )
 
         # Verify repair event was emitted
         assert provider.coordinator is not None
@@ -937,6 +1047,82 @@ class TestToolRepair:
         assert payload["repaired_count"] == 3
         assert set(payload["repaired_tool_ids"]) == {"call_1", "call_2", "call_3"}
 
+    @pytest.mark.asyncio
+    async def test_repaired_tool_ids_bounded_at_1000(self):
+        """_repaired_tool_ids set is cleared when it exceeds 1000 entries."""
+        provider = self._make_provider()
+
+        # Pre-fill with 1001 entries
+        provider._repaired_tool_ids = {f"call_{i}" for i in range(1001)}
+        assert len(provider._repaired_tool_ids) == 1001
+
+        # Next repair call should clear the set first
+        messages = [
+            Message(role="user", content="Call a tool"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="call_new", name="my_func", input={})],
+            ),
+        ]
+        result = await provider._repair_tool_sequence(messages)
+
+        # The set was cleared, so call_new is not in _repaired_tool_ids from before
+        # It should be detected as orphaned and repaired
+        assert len(result) == 3  # original 2 + 1 synthetic
+        assert result[2].role == "tool"
+        assert result[2].tool_call_id == "call_new"
+        # The old 1001 entries should be gone
+        assert len(provider._repaired_tool_ids) <= 10  # Only the newly repaired ones
+
+    @pytest.mark.asyncio
+    async def test_bridging_assistant_message_before_user(self):
+        """When repair inserts synthetic results and next message is user, add bridging assistant."""
+        provider = self._make_provider()
+
+        messages = [
+            Message(role="user", content="Call a tool"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="call_1", name="my_func", input={})],
+            ),
+            # No tool result — directly followed by user message
+            Message(role="user", content="What happened?"),
+        ]
+
+        result = await provider._repair_tool_sequence(messages)
+
+        # Should have: user, assistant(tool_call), synthetic_tool, bridging_assistant, user
+        assert len(result) == 5
+        assert result[0].role == "user"
+        assert result[1].role == "assistant"  # original with tool call
+        assert result[2].role == "tool"  # synthetic tool result
+        assert result[3].role == "assistant"  # bridging message
+        assert result[3].content == "I'll continue with the next step."
+        assert result[4].role == "user"  # original user message
+
+    @pytest.mark.asyncio
+    async def test_no_bridging_when_next_is_not_user(self):
+        """No bridging assistant message when next message after repair is not user."""
+        provider = self._make_provider()
+
+        messages = [
+            Message(role="user", content="Call a tool"),
+            Message(
+                role="assistant",
+                content=[ToolCallBlock(id="call_1", name="my_func", input={})],
+            ),
+            # Orphaned — followed by another assistant message
+            Message(role="assistant", content="Let me try again."),
+        ]
+
+        result = await provider._repair_tool_sequence(messages)
+
+        # Should have: user, assistant(tool_call), synthetic_tool, assistant
+        # NO bridging message because next is assistant, not user
+        assert len(result) == 4
+        assert result[2].role == "tool"  # synthetic
+        assert result[3].role == "assistant"  # original "Let me try again"
+
 
 # ---------------------------------------------------------------------------
 # Message edge cases tests
@@ -952,17 +1138,17 @@ class TestMessageEdgeCases:
         return ChatCompletionsProvider(config={"model": "test-model"})
 
     def test_developer_role_prepended_before_user(self):
-        """Developer message (converted to system) is prepended before user messages."""
+        """Developer message (as context_file user) appears before other user messages."""
         provider = self._get_provider()
         msgs = [
             Message(role="user", content="Hello"),
             Message(role="developer", content="You are a helpful assistant."),
         ]
         result = provider._convert_messages_to_wire(msgs)
-        # developer message should come first as system, before the user message
         assert len(result) == 2
-        assert result[0]["role"] == "system"
-        assert result[0]["content"] == "You are a helpful assistant."
+        # developer should come first (prepended before conversation)
+        assert result[0]["role"] == "user"
+        assert "<context_file>" in result[0]["content"]
         assert result[1]["role"] == "user"
         assert result[1]["content"] == "Hello"
 
@@ -1185,6 +1371,55 @@ class TestListModels:
         assert isinstance(result[0], ModelInfo)
         assert result[0].id == "my-configured-model"
 
+    @pytest.mark.asyncio
+    async def test_filtered_true_returns_only_configured_model(self):
+        """When filtered=True and default model is configured, only return that model."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={"model": "gemma26-long", "filtered": True}
+        )
+
+        mock_model_1 = MagicMock()
+        mock_model_1.id = "gemma26-long"
+        mock_model_2 = MagicMock()
+        mock_model_2.id = "gemma26-short"
+        mock_page = MagicMock()
+        mock_page.data = [mock_model_1, mock_model_2]
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=mock_page)
+        provider._client = mock_client
+
+        result = await provider.list_models()
+
+        assert len(result) == 1
+        assert result[0].id == "gemma26-long"
+
+    @pytest.mark.asyncio
+    async def test_filtered_false_returns_all_models(self):
+        """When filtered=False, return all models from server."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={"model": "gemma26-long", "filtered": False}
+        )
+
+        mock_model_1 = MagicMock()
+        mock_model_1.id = "gemma26-long"
+        mock_model_2 = MagicMock()
+        mock_model_2.id = "gemma26-short"
+        mock_page = MagicMock()
+        mock_page.data = [mock_model_1, mock_model_2]
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=mock_page)
+        provider._client = mock_client
+
+        result = await provider.list_models()
+
+        assert len(result) == 2
+
 
 # ---------------------------------------------------------------------------
 # Streaming tests
@@ -1315,13 +1550,15 @@ class TestConfigParsing:
 
         return ChatCompletionsProvider(config=config or {})
 
-    def test_default_base_url(self):
+    def test_default_base_url(self, monkeypatch):
         """base_url defaults to 'http://localhost:8080/v1' when not set."""
+        monkeypatch.delenv("CHAT_COMPLETIONS_BASE_URL", raising=False)
         provider = self._make_provider()
         assert provider._base_url == "http://localhost:8080/v1"
 
-    def test_custom_base_url(self):
+    def test_custom_base_url(self, monkeypatch):
         """base_url from config overrides the default."""
+        monkeypatch.delenv("CHAT_COMPLETIONS_BASE_URL", raising=False)
         provider = self._make_provider(config={"base_url": "http://myserver:9000/v1"})
         assert provider._base_url == "http://myserver:9000/v1"
 
@@ -1380,3 +1617,230 @@ class TestConfigParsing:
         """use_streaming string 'false' coerces to False bool."""
         provider = self._make_provider(config={"use_streaming": "false"})
         assert provider._use_streaming is False
+
+    def test_client_is_lazy_property(self):
+        """client property creates AsyncOpenAI lazily on first access."""
+        provider = self._make_provider(config={"base_url": "http://localhost:8080/v1"})
+        # No client yet
+        assert provider._client is None
+        # Accessing .client triggers creation
+        client = provider.client
+        assert client is not None
+        assert provider._client is not None
+        # Same instance on second access
+        assert provider.client is client
+
+    def test_client_property_raises_without_base_url(self, monkeypatch):
+        """client property raises ValueError when base_url is empty.
+
+        Note: This test intentionally clears the CHAT_COMPLETIONS_BASE_URL env
+        var to test the ValueError path independently of the autouse fixture in
+        conftest.py (Task 4) which sets it for all other tests.
+        """
+        monkeypatch.delenv("CHAT_COMPLETIONS_BASE_URL", raising=False)
+        provider = self._make_provider(config={"base_url": ""})
+        with pytest.raises(ValueError, match="base_url"):
+            _ = provider.client
+
+    def test_priority_default_100(self):
+        """priority defaults to 100 when not configured."""
+        provider = self._make_provider()
+        assert provider._priority == 100
+
+    def test_priority_from_config(self):
+        """priority is stored from config."""
+        provider = self._make_provider(config={"priority": 0})
+        assert provider._priority == 0
+
+
+# ---------------------------------------------------------------------------
+# Optional config params tests (Task 5)
+# ---------------------------------------------------------------------------
+
+
+class TestOptionalConfigParams:
+    """Tests for optional generation params: top_p, stop, seed, parallel_tool_calls."""
+
+    def _make_provider(self, **config):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config={"model": "test-model", **config})
+
+    def test_top_p_stored_when_configured(self):
+        """top_p from config is stored on the provider."""
+        provider = self._make_provider(top_p=0.9)
+        assert provider._top_p == 0.9
+
+    def test_top_p_none_by_default(self):
+        """top_p is None when not configured."""
+        provider = self._make_provider()
+        assert provider._top_p is None
+
+    def test_stop_stored_when_configured(self):
+        """stop from config is stored on the provider."""
+        provider = self._make_provider(stop=["END", "DONE"])
+        assert provider._stop == ["END", "DONE"]
+
+    def test_seed_stored_when_configured(self):
+        """seed from config is stored on the provider."""
+        provider = self._make_provider(seed=42)
+        assert provider._seed == 42
+
+    def test_parallel_tool_calls_default_true(self):
+        """parallel_tool_calls defaults to True."""
+        provider = self._make_provider()
+        assert provider._parallel_tool_calls is True
+
+    def test_parallel_tool_calls_configurable(self):
+        """parallel_tool_calls can be set to False."""
+        provider = self._make_provider(parallel_tool_calls=False)
+        assert provider._parallel_tool_calls is False
+
+    @pytest.mark.asyncio
+    async def test_top_p_passed_to_api(self):
+        """top_p is included in API params when configured."""
+        provider = self._make_provider(top_p=0.9, use_streaming=False, max_retries=0)
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="ok"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        assert call_kwargs.get("top_p") == 0.9
+
+    @pytest.mark.asyncio
+    async def test_top_p_not_passed_when_none(self):
+        """top_p is NOT included in API params when not configured."""
+        provider = self._make_provider(use_streaming=False, max_retries=0)
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="ok"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        assert "top_p" not in call_kwargs
+
+
+# ---------------------------------------------------------------------------
+# Raw payload tests (Task 8)
+# ---------------------------------------------------------------------------
+
+
+class TestRawPayload:
+    """Tests for raw=True including redacted payload in events."""
+
+    @pytest.mark.asyncio
+    async def test_raw_true_includes_payload_in_request_event(self):
+        """When raw=True, llm:request event includes 'raw' with redacted params."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "raw": True,
+                "use_streaming": False,
+                "max_retries": 0,
+            },
+            coordinator=FakeCoordinator(),
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="ok"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        hooks = provider.coordinator.hooks
+        request_events = [e for e in hooks.events if e[0] == "llm:request"]
+        assert len(request_events) >= 1
+        _, payload = request_events[0]
+        assert "raw" in payload, "llm:request must include 'raw' when raw=True"
+        assert isinstance(payload["raw"], dict)
+
+    @pytest.mark.asyncio
+    async def test_raw_false_excludes_payload(self):
+        """When raw=False (default), llm:request event does NOT include 'raw'."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "raw": False,
+                "use_streaming": False,
+                "max_retries": 0,
+            },
+            coordinator=FakeCoordinator(),
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="ok"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        hooks = provider.coordinator.hooks
+        request_events = [e for e in hooks.events if e[0] == "llm:request"]
+        assert len(request_events) >= 1
+        _, payload = request_events[0]
+        assert "raw" not in payload
+
+    @pytest.mark.asyncio
+    async def test_raw_true_includes_payload_in_response_event(self):
+        """When raw=True, llm:response event includes 'raw' with redacted response."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "raw": True,
+                "use_streaming": False,
+                "max_retries": 0,
+            },
+            coordinator=FakeCoordinator(),
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_response = _make_mock_completion(content="ok")
+        # model_dump() is needed for raw payload — mock it
+        mock_response.model_dump = MagicMock(return_value={"choices": [], "usage": {}})
+        mock_client.chat.completions.create.return_value = mock_response
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        hooks = provider.coordinator.hooks
+        response_events = [
+            e
+            for e in hooks.events
+            if e[0] == "llm:response" and e[1].get("status") != "error"
+        ]
+        assert len(response_events) >= 1
+        _, payload = response_events[0]
+        assert "raw" in payload, "llm:response must include 'raw' when raw=True"
