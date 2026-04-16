@@ -9,6 +9,7 @@ Tests verify:
 - Response building (outbound: API response -> ChatResponse)
 - get_info() returns ProviderInfo with correct fields
 - close() works safely with and without a client initialized
+- Retry with backoff on retryable errors
 """
 
 import asyncio
@@ -20,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import openai
 
 from amplifier_core.message_models import (
+    ChatRequest,
     ChatResponse,
     Message,
     TextBlock,
@@ -580,3 +582,67 @@ class TestClose:
         await provider.close()
 
         mock_client.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Retry tests
+# ---------------------------------------------------------------------------
+
+
+class TestRetry:
+    """Verify retry behaviour in complete()."""
+
+    def _make_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "max_retries": "2",
+                "min_retry_delay": "0.01",
+                "max_retry_delay": "0.02",
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_retries_on_retryable_error(self):
+        """Retryable errors (APIConnectionError) cause retries up to max_retries."""
+        provider = self._make_provider()
+        mock_client = AsyncMock()
+        provider._client = mock_client
+
+        conn_error = openai.APIConnectionError(request=MagicMock())
+        mock_response = _make_mock_completion(content="done")
+        mock_client.chat.completions.create.side_effect = [
+            conn_error,
+            conn_error,
+            mock_response,
+        ]
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        result = await provider.complete(request)
+        assert result is not None
+        assert mock_client.chat.completions.create.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_no_retry_on_non_retryable_error(self):
+        """Non-retryable errors (AuthenticationError) are raised immediately with no retries."""
+        provider = self._make_provider()
+        mock_client = AsyncMock()
+        provider._client = mock_client
+
+        auth_error = _make_openai_error(openai.AuthenticationError, "invalid key", 401)
+        mock_client.chat.completions.create.side_effect = auth_error
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+
+        with pytest.raises(KernelAuthenticationError):
+            await provider.complete(request)
+
+        assert mock_client.chat.completions.create.call_count == 1

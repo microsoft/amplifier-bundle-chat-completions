@@ -11,6 +11,7 @@ from typing import Any
 
 import openai
 
+from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.llm_errors import AccessDeniedError as KernelAccessDeniedError
 from amplifier_core.llm_errors import AuthenticationError as KernelAuthenticationError
 from amplifier_core.llm_errors import ContentFilterError as KernelContentFilterError
@@ -64,6 +65,10 @@ class ChatCompletionsProvider:
         self.coordinator = coordinator
         self._model: str = str(self.config.get("model", ""))
         self._client: openai.AsyncOpenAI | None = None
+        self._timeout: float = float(self.config.get("timeout", 60))
+        self._max_retries: int = int(self.config.get("max_retries", 3))
+        self._min_retry_delay: float = float(self.config.get("min_retry_delay", 1.0))
+        self._max_retry_delay: float = float(self.config.get("max_retry_delay", 60.0))
 
     def _translate_error(self, exc: Exception) -> KernelLLMError:
         """Translate an OpenAI SDK exception to a kernel error type.
@@ -360,8 +365,8 @@ class ChatCompletionsProvider:
         """Send a chat request and return a ChatResponse.
 
         Lazily initialises the AsyncOpenAI client on the first call.  Wraps
-        the API call in ``asyncio.timeout`` and translates any exception via
-        ``_translate_error``.
+        each individual attempt in ``asyncio.timeout`` and retries retryable
+        errors with exponential backoff via ``retry_with_backoff``.
 
         Args:
             request: The unified ChatRequest to execute.
@@ -387,19 +392,43 @@ class ChatCompletionsProvider:
         )
 
         model = request.model or self._model
-        timeout = request.timeout or float(self.config.get("timeout", 60))
 
-        try:
-            async with asyncio.timeout(timeout):
-                response = await self._client.chat.completions.create(
-                    model=model,
-                    messages=wire_messages,  # type: ignore[arg-type]
-                    tools=wire_tools,  # type: ignore[arg-type]
-                    stream=False,
+        retry_config = RetryConfig(
+            max_retries=self._max_retries,
+            initial_delay=self._min_retry_delay,
+            max_delay=self._max_retry_delay,
+        )
+
+        async def _on_retry(attempt: int, delay: float, error: Any) -> None:
+            if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:retry",
+                    {
+                        "provider": "chat-completions",
+                        "attempt": attempt,
+                        "delay": delay,
+                        "max_retries": self._max_retries,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
                 )
-            return self._build_response(response)
-        except Exception as exc:
-            raise self._translate_error(exc) from exc
+
+        async def _single_attempt() -> ChatResponse:
+            try:
+                async with asyncio.timeout(self._timeout):
+                    response = await self._client.chat.completions.create(  # type: ignore[union-attr]
+                        model=model,
+                        messages=wire_messages,  # type: ignore[arg-type]
+                        tools=wire_tools,  # type: ignore[arg-type]
+                        stream=False,
+                    )
+                return self._build_response(response)
+            except Exception as exc:
+                raise self._translate_error(exc) from exc
+
+        return await retry_with_backoff(
+            _single_attempt, config=retry_config, on_retry=_on_retry
+        )
 
     def get_info(self) -> ProviderInfo:
         """Return metadata describing this provider's capabilities and configuration.
