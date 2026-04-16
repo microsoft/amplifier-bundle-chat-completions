@@ -8,7 +8,7 @@ Environment variables:
                           (default: http://localhost:8080/v1 on host,
                            or http://host.docker.internal:8080/v1 from container)
     INTEGRATION_MODEL:    Override the model name
-                          (default: gemma-4-26b-a4b-it-Q4_K_M.gguf)
+                          (default: gemma26-long)
 
 Run integration tests explicitly:
     pytest tests/test_integration.py -v
@@ -39,9 +39,7 @@ from amplifier_module_provider_chat_completions import ChatCompletionsProvider
 INTEGRATION_BASE_URL: str = os.environ.get(
     "INTEGRATION_BASE_URL", "http://localhost:8080/v1"
 )
-INTEGRATION_MODEL: str = os.environ.get(
-    "INTEGRATION_MODEL", "gemma26-long"
-)
+INTEGRATION_MODEL: str = os.environ.get("INTEGRATION_MODEL", "gemma26-long")
 
 
 def _server_reachable() -> bool:
