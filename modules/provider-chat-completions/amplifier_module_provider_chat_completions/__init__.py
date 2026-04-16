@@ -920,7 +920,7 @@ class ChatCompletionsProvider:
                     field_type="text",
                     prompt="Maximum delay between retries in seconds",
                     required=False,
-                    default="60.0",
+                    default="30.0",
                 ),
                 ConfigField(
                     id="use_streaming",
@@ -928,7 +928,7 @@ class ChatCompletionsProvider:
                     field_type="boolean",
                     prompt="Enable streaming responses",
                     required=False,
-                    default="false",
+                    default="true",
                 ),
             ],
         )

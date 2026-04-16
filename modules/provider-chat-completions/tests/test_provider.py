@@ -735,6 +735,7 @@ class TestToolRepair:
         assert "[ERROR] Tool result missing" in str(synthetic.content)
 
         # Verify repair event was emitted
+        assert provider.coordinator is not None
         events = provider.coordinator.hooks.events
         repair_events = [e for e in events if e[0] == "provider:tool_sequence_repaired"]
         assert len(repair_events) == 1
@@ -767,6 +768,7 @@ class TestToolRepair:
         assert len(result2) == 2  # No additional injection
 
         # Only 1 repair event total (emitted during first call only)
+        assert provider.coordinator is not None
         events = provider.coordinator.hooks.events
         repair_events = [e for e in events if e[0] == "provider:tool_sequence_repaired"]
         assert len(repair_events) == 1
@@ -795,6 +797,7 @@ class TestToolRepair:
         assert len(result) == 5
 
         # Verify the repair event
+        assert provider.coordinator is not None
         events = provider.coordinator.hooks.events
         repair_events = [e for e in events if e[0] == "provider:tool_sequence_repaired"]
         assert len(repair_events) == 1
@@ -930,6 +933,7 @@ class TestObservabilityEvents:
         )
         await provider.complete(request)
 
+        assert provider.coordinator is not None
         hooks = provider.coordinator.hooks
         request_events = [e for e in hooks.events if e[0] == "llm:request"]
         assert len(request_events) >= 1, "llm:request event must be emitted"
@@ -958,6 +962,7 @@ class TestObservabilityEvents:
         )
         await provider.complete(request)
 
+        assert provider.coordinator is not None
         hooks = provider.coordinator.hooks
         # Filter for non-error llm:response events
         response_events = [
