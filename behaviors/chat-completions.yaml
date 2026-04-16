@@ -1,0 +1,8 @@
+bundle:
+  name: chat-completions-behavior
+  version: 1.0.0
+  description: Provider for OpenAI Chat Completions API compatible servers
+
+providers:
+  - module: provider-chat-completions
+    source: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#subdirectory=modules/provider-chat-completions
