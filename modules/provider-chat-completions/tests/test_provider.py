@@ -5,14 +5,25 @@ Tests verify:
 - mount() function is callable
 - mount() returns a coroutine (async function)
 - Error translation from OpenAI SDK exceptions to kernel error types
+- Message conversion (inbound: messages -> wire format)
+- Response building (outbound: API response -> ChatResponse)
 """
 
 import asyncio
+import json
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import openai
-import pytest
+
+from amplifier_core.message_models import (
+    ChatResponse,
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+)
 
 import amplifier_module_provider_chat_completions as module
 from amplifier_core.llm_errors import (
@@ -102,7 +113,11 @@ class TestErrorTranslation:
         from amplifier_module_provider_chat_completions import ChatCompletionsProvider
 
         provider = ChatCompletionsProvider(
-            config={"model": "test-model", "use_streaming": "false", "max_retries": "0"},
+            config={
+                "model": "test-model",
+                "use_streaming": "false",
+                "max_retries": "0",
+            },
         )
         provider.coordinator = cast(MagicMock, FakeCoordinator())
         return provider
@@ -140,9 +155,7 @@ class TestErrorTranslation:
 
     def test_bad_request_too_many_tokens(self):
         provider = self._get_provider()
-        sdk_err = _make_openai_error(
-            openai.BadRequestError, "too many tokens", 400
-        )
+        sdk_err = _make_openai_error(openai.BadRequestError, "too many tokens", 400)
         err = provider._translate_error(sdk_err)
         assert isinstance(err, KernelContextLengthError)
 
@@ -157,35 +170,27 @@ class TestErrorTranslation:
 
     def test_bad_request_blocked(self):
         provider = self._get_provider()
-        sdk_err = _make_openai_error(
-            openai.BadRequestError, "request blocked", 400
-        )
+        sdk_err = _make_openai_error(openai.BadRequestError, "request blocked", 400)
         err = provider._translate_error(sdk_err)
         assert isinstance(err, KernelContentFilterError)
 
     def test_bad_request_generic(self):
         provider = self._get_provider()
-        sdk_err = _make_openai_error(
-            openai.BadRequestError, "invalid model name", 400
-        )
+        sdk_err = _make_openai_error(openai.BadRequestError, "invalid model name", 400)
         err = provider._translate_error(sdk_err)
         assert isinstance(err, KernelInvalidRequestError)
         assert err.retryable is False
 
     def test_authentication_error(self):
         provider = self._get_provider()
-        sdk_err = _make_openai_error(
-            openai.AuthenticationError, "invalid key", 401
-        )
+        sdk_err = _make_openai_error(openai.AuthenticationError, "invalid key", 401)
         err = provider._translate_error(sdk_err)
         assert isinstance(err, KernelAuthenticationError)
         assert err.retryable is False
 
     def test_permission_denied_error(self):
         provider = self._get_provider()
-        sdk_err = _make_openai_error(
-            openai.PermissionDeniedError, "forbidden", 403
-        )
+        sdk_err = _make_openai_error(openai.PermissionDeniedError, "forbidden", 403)
         err = provider._translate_error(sdk_err)
         assert isinstance(err, KernelAccessDeniedError)
         assert err.retryable is False
@@ -199,9 +204,7 @@ class TestErrorTranslation:
 
     def test_5xx_server_error(self):
         provider = self._get_provider()
-        sdk_err = _make_openai_error(
-            openai.InternalServerError, "internal error", 500
-        )
+        sdk_err = _make_openai_error(openai.InternalServerError, "internal error", 500)
         err = provider._translate_error(sdk_err)
         assert isinstance(err, KernelProviderUnavailableError)
         assert err.retryable is True
@@ -241,3 +244,220 @@ class TestErrorTranslation:
         original = _make_openai_error(openai.RateLimitError, "x", 429)
         err = provider._translate_error(original)
         assert err.__cause__ is original
+
+
+# ---------------------------------------------------------------------------
+# Message conversion tests (inbound: internal -> wire format)
+# ---------------------------------------------------------------------------
+
+
+class TestMessageConversionInbound:
+    """Tests for _convert_messages_to_wire: internal Message list -> OpenAI wire dicts."""
+
+    def _get_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config={"model": "test-model"})
+
+    def test_string_content(self):
+        """String content passes through as-is with the original role."""
+        provider = self._get_provider()
+        msgs = [Message(role="user", content="hello")]
+        result = provider._convert_messages_to_wire(msgs)
+        assert result == [{"role": "user", "content": "hello"}]
+
+    def test_text_blocks_joined(self):
+        """Multiple TextBlocks in content list are joined with newline."""
+        provider = self._get_provider()
+        msgs = [
+            Message(
+                role="user",
+                content=[TextBlock(text="hello"), TextBlock(text="world")],
+            )
+        ]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == "hello\nworld"
+
+    def test_thinking_blocks_dropped(self):
+        """ThinkingBlocks are silently omitted from the wire format."""
+        provider = self._get_provider()
+        msgs = [
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(thinking="internal reasoning"),
+                    TextBlock(text="final answer"),
+                ],
+            )
+        ]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0]["content"] == "final answer"
+        # No trace of the thinking block
+        assert "thinking" not in str(result[0])
+
+    def test_tool_call_blocks_become_tool_calls(self):
+        """ToolCallBlocks produce a tool_calls array with JSON-string arguments."""
+        provider = self._get_provider()
+        msgs = [
+            Message(
+                role="assistant",
+                content=[
+                    ToolCallBlock(id="call_1", name="my_func", input={"arg": "val"})
+                ],
+            )
+        ]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        wire = result[0]
+        assert wire["role"] == "assistant"
+        assert "tool_calls" in wire
+        assert len(wire["tool_calls"]) == 1
+        tc = wire["tool_calls"][0]
+        assert tc["id"] == "call_1"
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "my_func"
+        # arguments must be a JSON string, not a dict
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"arg": "val"}
+
+    def test_tool_result_becomes_tool_message(self):
+        """ToolResultBlock in a message produces a tool-role wire message."""
+        provider = self._get_provider()
+        msgs = [
+            Message(
+                role="tool",
+                content=[ToolResultBlock(tool_call_id="call_1", output="42")],
+            )
+        ]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0] == {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "42",
+        }
+
+    def test_developer_role_becomes_system(self):
+        """'developer' role is remapped to 'system' for OpenAI compatibility."""
+        provider = self._get_provider()
+        msgs = [Message(role="developer", content="You are a helpful assistant.")]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "You are a helpful assistant."
+
+    def test_system_role_passthrough(self):
+        """'system' role is preserved unchanged."""
+        provider = self._get_provider()
+        msgs = [Message(role="system", content="system prompt")]
+        result = provider._convert_messages_to_wire(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "system prompt"
+
+
+# ---------------------------------------------------------------------------
+# Response building tests (outbound: OpenAI response -> ChatResponse)
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_completion(
+    content=None,
+    tool_calls=None,
+    reasoning_content=None,
+    finish_reason="stop",
+    prompt_tokens=10,
+    completion_tokens=5,
+    total_tokens=15,
+):
+    """Build a minimal mock of an OpenAI ChatCompletion object."""
+    message = MagicMock()
+    message.content = content
+    message.tool_calls = tool_calls
+    message.reasoning_content = reasoning_content  # None unless set
+
+    choice = MagicMock()
+    choice.message = message
+    choice.finish_reason = finish_reason
+
+    usage = MagicMock()
+    usage.prompt_tokens = prompt_tokens
+    usage.completion_tokens = completion_tokens
+    usage.total_tokens = total_tokens
+
+    response = MagicMock()
+    response.choices = [choice]
+    response.usage = usage
+    return response
+
+
+class TestMessageConversionOutbound:
+    """Tests for _build_response: OpenAI ChatCompletion -> ChatResponse."""
+
+    def _get_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(config={"model": "test-model"})
+
+    def test_text_response(self):
+        """message.content becomes a TextBlock in the ChatResponse."""
+        provider = self._get_provider()
+        response = _make_mock_completion(content="Hello there")
+        result = provider._build_response(response)
+
+        assert isinstance(result, ChatResponse)
+        text_blocks = [b for b in result.content if isinstance(b, TextBlock)]
+        assert len(text_blocks) == 1
+        assert text_blocks[0].text == "Hello there"
+        # Usage is mapped from prompt/completion tokens
+        assert result.usage is not None
+        assert result.usage.input_tokens == 10
+        assert result.usage.output_tokens == 5
+        assert result.usage.total_tokens == 15
+
+    def test_tool_call_response(self):
+        """message.tool_calls produce ToolCallBlock in content and ToolCall in tool_calls."""
+        provider = self._get_provider()
+
+        mock_tc = MagicMock()
+        mock_tc.id = "call_abc"
+        mock_tc.function.name = "search"
+        mock_tc.function.arguments = json.dumps({"query": "test"})
+
+        response = _make_mock_completion(content=None, tool_calls=[mock_tc])
+        result = provider._build_response(response)
+
+        assert isinstance(result, ChatResponse)
+        # ToolCallBlock in content
+        call_blocks = [b for b in result.content if isinstance(b, ToolCallBlock)]
+        assert len(call_blocks) == 1
+        assert call_blocks[0].id == "call_abc"
+        assert call_blocks[0].name == "search"
+        assert call_blocks[0].input == {"query": "test"}
+        # ToolCall in tool_calls field
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].id == "call_abc"
+        assert result.tool_calls[0].name == "search"
+        assert result.tool_calls[0].arguments == {"query": "test"}
+
+    def test_reasoning_content_becomes_thinking_block(self):
+        """reasoning_content on the message becomes a ThinkingBlock in content."""
+        provider = self._get_provider()
+        response = _make_mock_completion(
+            content="The answer is 42.",
+            reasoning_content="Let me think step by step...",
+        )
+        result = provider._build_response(response)
+
+        assert isinstance(result, ChatResponse)
+        thinking_blocks = [b for b in result.content if isinstance(b, ThinkingBlock)]
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0].thinking == "Let me think step by step..."
+        # Text content should still be present
+        text_blocks = [b for b in result.content if isinstance(b, TextBlock)]
+        assert len(text_blocks) == 1
+        assert text_blocks[0].text == "The answer is 42."
