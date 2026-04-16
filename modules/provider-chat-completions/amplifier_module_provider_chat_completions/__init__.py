@@ -62,6 +62,7 @@ class ChatCompletionsProvider:
         self.config = config or {}
         self.coordinator = coordinator
         self._model: str = str(self.config.get("model", ""))
+        self._client: openai.AsyncOpenAI | None = None
 
     def _translate_error(self, exc: Exception) -> KernelLLMError:
         """Translate an OpenAI SDK exception to a kernel error type.
@@ -371,13 +372,13 @@ class ChatCompletionsProvider:
             KernelLLMError subclass on any provider failure.
         """
         # Lazy-initialize the AsyncOpenAI client.
-        if not hasattr(self, "_client") or self._client is None:
+        if self._client is None:
             client_kwargs: dict[str, Any] = {}
             if self.config.get("api_key"):
                 client_kwargs["api_key"] = self.config["api_key"]
             if self.config.get("base_url"):
                 client_kwargs["base_url"] = self.config["base_url"]
-            self._client: openai.AsyncOpenAI = openai.AsyncOpenAI(**client_kwargs)
+            self._client = openai.AsyncOpenAI(**client_kwargs)
 
         wire_messages = self._convert_messages_to_wire(request.messages)
         wire_tools = (
@@ -401,7 +402,7 @@ class ChatCompletionsProvider:
 
     async def close(self) -> None:
         """Release any resources held by this provider."""
-        if hasattr(self, "_client") and self._client is not None:
+        if self._client is not None:
             await self._client.close()
             self._client = None
 
