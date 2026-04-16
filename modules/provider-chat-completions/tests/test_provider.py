@@ -15,7 +15,6 @@ Tests verify:
 import asyncio
 import json
 import pytest
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import openai
@@ -124,7 +123,7 @@ class TestErrorTranslation:
                 "max_retries": "0",
             },
         )
-        provider.coordinator = cast(MagicMock, FakeCoordinator())
+        provider.coordinator = FakeCoordinator()
         return provider
 
     def test_timeout_error(self):
@@ -561,14 +560,15 @@ class TestGetInfo:
 class TestClose:
     """Verify close() works safely with and without a client initialized."""
 
-    def test_close_with_no_client_does_not_raise(self):
+    @pytest.mark.asyncio
+    async def test_close_with_no_client_does_not_raise(self):
         """close() must not raise when _client is None."""
         from amplifier_module_provider_chat_completions import ChatCompletionsProvider
 
         provider = ChatCompletionsProvider(config={})
         assert provider._client is None
         # Should not raise
-        asyncio.run(provider.close())
+        await provider.close()
 
     @pytest.mark.asyncio
     async def test_close_calls_client_close(self):
@@ -646,3 +646,49 @@ class TestRetry:
             await provider.complete(request)
 
         assert mock_client.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_emits_provider_retry_event(self):
+        """provider:retry event is emitted on each retry attempt."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "max_retries": "2",
+                "min_retry_delay": "0.01",
+                "max_retry_delay": "0.02",
+            },
+            coordinator=FakeCoordinator(),
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+
+        conn_error = openai.APIConnectionError(request=MagicMock())
+        mock_response = _make_mock_completion(content="done")
+        mock_client.chat.completions.create.side_effect = [
+            conn_error,
+            conn_error,
+            mock_response,
+        ]
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        # Two retries should each emit one provider:retry event.
+        assert provider.coordinator is not None
+        hooks = provider.coordinator.hooks
+        retry_events = [e for e in hooks.events if e[0] == "provider:retry"]
+        assert len(retry_events) == 2
+
+        # Verify payload shape on the first event.
+        _, payload = retry_events[0]
+        assert payload["provider"] == "chat-completions"
+        assert payload["max_retries"] == 2
+        assert "attempt" in payload
+        assert "delay" in payload
+        assert "error_type" in payload
+        assert "error_message" in payload

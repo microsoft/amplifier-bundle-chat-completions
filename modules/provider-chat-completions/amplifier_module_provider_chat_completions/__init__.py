@@ -84,7 +84,7 @@ class ChatCompletionsProvider:
             A KernelLLMError subclass with provider, model, and retryable set.
             The __cause__ attribute is set to the original exception.
         """
-        provider = "chat-completions"
+        provider = self.name
         model = self._model
         err: KernelLLMError
 
@@ -404,7 +404,7 @@ class ChatCompletionsProvider:
                 await self.coordinator.hooks.emit(
                     "provider:retry",
                     {
-                        "provider": "chat-completions",
+                        "provider": self.name,
                         "attempt": attempt,
                         "delay": delay,
                         "max_retries": self._max_retries,
