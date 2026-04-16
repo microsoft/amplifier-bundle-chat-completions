@@ -72,6 +72,11 @@ class ChatCompletionsProvider:
         self._min_retry_delay: float = float(self.config.get("min_retry_delay", 1.0))
         self._max_retry_delay: float = float(self.config.get("max_retry_delay", 60.0))
         self._repaired_tool_ids: set[str] = set()
+        use_streaming = self.config.get("use_streaming", False)
+        if isinstance(use_streaming, bool):
+            self._use_streaming: bool = use_streaming
+        else:
+            self._use_streaming = str(use_streaming).lower() in ("true", "1", "yes")
 
     def _translate_error(self, exc: Exception) -> KernelLLMError:
         """Translate an OpenAI SDK exception to a kernel error type.
@@ -458,6 +463,159 @@ class ChatCompletionsProvider:
             finish_reason=choice.finish_reason,
         )
 
+    async def _complete_non_streaming(
+        self,
+        wire_messages: list[dict[str, Any]],
+        wire_tools: list[dict[str, Any]] | None,
+        request: "ChatRequest",
+    ) -> "ChatResponse":
+        """Execute a non-streaming chat completion and return a ChatResponse.
+
+        Args:
+            wire_messages: Messages already converted to OpenAI wire format.
+            wire_tools: Tools already converted to OpenAI wire format, or None.
+            request: The original ChatRequest (used to resolve model).
+
+        Returns:
+            A ChatResponse built from the completed API response.
+        """
+        model = request.model or self._model
+        response = await self._client.chat.completions.create(  # type: ignore[union-attr]
+            model=model,
+            messages=wire_messages,  # type: ignore[arg-type]
+            tools=wire_tools,  # type: ignore[arg-type]
+            stream=False,
+        )
+        return self._build_response(response)
+
+    async def _complete_streaming(
+        self,
+        wire_messages: list[dict[str, Any]],
+        wire_tools: list[dict[str, Any]] | None,
+        request: "ChatRequest",
+    ) -> "ChatResponse":
+        """Execute a streaming chat completion and accumulate chunks into a ChatResponse.
+
+        Calls the API with ``stream=True``, iterates the async chunk stream, and
+        accumulates:
+        - ``delta.content`` into a text buffer
+        - ``delta.tool_calls`` by index (first chunk per index carries ``id`` and
+          ``function.name``; subsequent chunks append to ``function.arguments``)
+        - ``reasoning_content`` into a thinking buffer (via ``getattr`` for safety)
+        - ``finish_reason`` from the last non-empty choice
+        - ``usage`` from the final chunk if present
+
+        Args:
+            wire_messages: Messages already converted to OpenAI wire format.
+            wire_tools: Tools already converted to OpenAI wire format, or None.
+            request: The original ChatRequest (used to resolve model).
+
+        Returns:
+            A ChatResponse built from the accumulated streaming data.
+        """
+        model = request.model or self._model
+
+        text_buffer: str = ""
+        thinking_buffer: str = ""
+        # Maps chunk index -> accumulated tool call data
+        tool_call_accum: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        usage: Any = None
+
+        stream = await self._client.chat.completions.create(  # type: ignore[union-attr]
+            model=model,
+            messages=wire_messages,  # type: ignore[arg-type]
+            tools=wire_tools,  # type: ignore[arg-type]
+            stream=True,
+        )
+
+        async for chunk in stream:
+            # Capture usage if present on any chunk (typically the final one).
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+            if not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            # Track finish_reason from the last chunk that has one.
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+            # Accumulate text content.
+            if delta.content:
+                text_buffer += delta.content
+
+            # Accumulate reasoning/thinking content (provider-specific extension).
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                thinking_buffer += reasoning
+
+            # Accumulate tool call deltas by index.
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_call_accum:
+                        # First chunk for this index: capture id and name.
+                        tool_call_accum[idx] = {
+                            "id": tc_delta.id,
+                            "name": tc_delta.function.name,
+                            "arguments": "",
+                        }
+                    # All chunks: append to arguments.
+                    if tc_delta.function.arguments:
+                        tool_call_accum[idx]["arguments"] += tc_delta.function.arguments
+
+        # Build content blocks from accumulated buffers.
+        content: list[Any] = []
+
+        if thinking_buffer:
+            content.append(ThinkingBlock(thinking=thinking_buffer))
+
+        if text_buffer:
+            content.append(TextBlock(text=text_buffer))
+
+        # Build tool calls from accumulated data (ordered by index).
+        tool_calls: list[ToolCall] | None = None
+        if tool_call_accum:
+            tool_calls = []
+            for idx in sorted(tool_call_accum.keys()):
+                tc_data = tool_call_accum[idx]
+                arguments = json.loads(tc_data["arguments"])
+                content.append(
+                    ToolCallBlock(
+                        id=tc_data["id"],
+                        name=tc_data["name"],
+                        input=arguments,
+                    )
+                )
+                tool_calls.append(
+                    ToolCall(
+                        id=tc_data["id"],
+                        name=tc_data["name"],
+                        arguments=arguments,
+                    )
+                )
+
+        # Map usage if captured from the stream.
+        usage_obj: Usage | None = None
+        if usage is not None:
+            usage_obj = Usage(
+                input_tokens=getattr(usage, "prompt_tokens", 0),
+                output_tokens=getattr(usage, "completion_tokens", 0),
+                total_tokens=getattr(usage, "total_tokens", 0),
+            )
+
+        return ChatResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage=usage_obj,
+            finish_reason=finish_reason,
+        )
+
     def _ensure_client(self) -> openai.AsyncOpenAI:
         """Return the AsyncOpenAI client, creating it lazily if not yet initialised.
 
@@ -534,8 +692,6 @@ class ChatCompletionsProvider:
             self._convert_tools_to_wire(request.tools) if request.tools else None
         )
 
-        model = request.model or self._model
-
         retry_config = RetryConfig(
             max_retries=self._max_retries,
             initial_delay=self._min_retry_delay,
@@ -567,13 +723,14 @@ class ChatCompletionsProvider:
             )
             try:
                 async with asyncio.timeout(self._timeout):
-                    response = await self._client.chat.completions.create(  # type: ignore[union-attr]
-                        model=model,
-                        messages=wire_messages,  # type: ignore[arg-type]
-                        tools=wire_tools,  # type: ignore[arg-type]
-                        stream=False,
-                    )
-                chat_response = self._build_response(response)
+                    if self._use_streaming:
+                        chat_response = await self._complete_streaming(
+                            wire_messages, wire_tools, request
+                        )
+                    else:
+                        chat_response = await self._complete_non_streaming(
+                            wire_messages, wire_tools, request
+                        )
             except Exception as exc:
                 duration_ms = (time.monotonic() - start_time) * 1000
                 kernel_error = self._translate_error(exc)

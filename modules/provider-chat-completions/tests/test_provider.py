@@ -1047,3 +1047,119 @@ class TestListModels:
         assert len(result) == 1
         assert isinstance(result[0], ModelInfo)
         assert result[0].id == "my-configured-model"
+
+
+# ---------------------------------------------------------------------------
+# Streaming tests
+# ---------------------------------------------------------------------------
+
+
+class TestStreaming:
+    """Tests for streaming path: _complete_streaming accumulates chunks."""
+
+    def _make_provider(self, use_streaming: bool = True):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "use_streaming": use_streaming,
+                "max_retries": "0",
+                "min_retry_delay": "0.01",
+                "max_retry_delay": "0.02",
+            }
+        )
+
+    def _make_chunk(
+        self, content=None, tool_calls=None, finish_reason=None, usage=None
+    ):
+        """Build a minimal mock of an OpenAI streaming chunk."""
+        delta = MagicMock()
+        delta.content = content
+        delta.tool_calls = tool_calls
+        # Explicitly set to None so getattr(delta, 'reasoning_content', None)
+        # returns None rather than a MagicMock truthy object.
+        delta.reasoning_content = None
+
+        choice = MagicMock()
+        choice.delta = delta
+        choice.finish_reason = finish_reason
+
+        chunk = MagicMock()
+        chunk.choices = [choice]
+        chunk.usage = usage
+        return chunk
+
+    @pytest.mark.asyncio
+    async def test_streaming_accumulates_text(self):
+        """Streaming path accumulates 3 text chunks into single TextBlock 'Hello world'."""
+        provider = self._make_provider()
+        mock_client = MagicMock()
+        provider._client = mock_client
+
+        chunks = [
+            self._make_chunk(content="Hello"),
+            self._make_chunk(content=" "),
+            self._make_chunk(content="world"),
+            self._make_chunk(content=None, finish_reason="stop"),
+        ]
+
+        async def async_chunks():
+            for chunk in chunks:
+                yield chunk
+
+        mock_client.chat.completions.create = AsyncMock(return_value=async_chunks())
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        result = await provider.complete(request)
+
+        text_blocks = [b for b in result.content if isinstance(b, TextBlock)]
+        assert len(text_blocks) == 1
+        assert text_blocks[0].text == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_streaming_accumulates_tool_calls(self):
+        """Streaming path accumulates split tool call deltas into valid tool call."""
+        provider = self._make_provider()
+        mock_client = MagicMock()
+        provider._client = mock_client
+
+        # First chunk: id, name, and start of arguments
+        tc1 = MagicMock()
+        tc1.index = 0
+        tc1.id = "call_1"
+        tc1.function.name = "grep"
+        tc1.function.arguments = '{"pattern":'
+
+        # Second chunk: rest of arguments (no id or name)
+        tc2 = MagicMock()
+        tc2.index = 0
+        tc2.id = None
+        tc2.function.name = None
+        tc2.function.arguments = ' "test"}'
+
+        chunks = [
+            self._make_chunk(tool_calls=[tc1]),
+            self._make_chunk(tool_calls=[tc2]),
+            self._make_chunk(content=None, finish_reason="tool_calls"),
+        ]
+
+        async def async_chunks():
+            for chunk in chunks:
+                yield chunk
+
+        mock_client.chat.completions.create = AsyncMock(return_value=async_chunks())
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="use grep")],
+            model="test-model",
+        )
+        result = await provider.complete(request)
+
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "grep"
+        assert result.tool_calls[0].arguments == {"pattern": "test"}
