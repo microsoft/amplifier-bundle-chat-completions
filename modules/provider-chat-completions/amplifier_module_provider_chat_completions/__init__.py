@@ -60,8 +60,6 @@ class ChatCompletionsChatResponse(ChatResponse):
 class ChatCompletionsProvider:
     """Provider for OpenAI-compatible chat completions API."""
 
-    name = "chat-completions"
-
     @staticmethod
     def _config_bool(value: Any) -> bool:
         """Parse config booleans from YAML or CLI string values."""
@@ -114,6 +112,11 @@ class ChatCompletionsProvider:
         """
         self.config = config or {}
         self.coordinator = coordinator
+
+        # Name: honor per-instance config so multiple chat-completions providers
+        # can be mounted with distinct routing identities. Falls back to the
+        # generic "chat-completions" name when not specified.
+        self.name: str = str(self.config.get("name", "chat-completions"))
 
         # base_url: env var takes precedence over config, then default.
         self._base_url: str = os.environ.get(
@@ -1050,8 +1053,8 @@ class ChatCompletionsProvider:
             all config field declarations.
         """
         return ProviderInfo(
-            id="chat-completions",
-            display_name="Chat Completions",
+            id=self.name,
+            display_name=f"Chat Completions ({self.name})" if self.name != "chat-completions" else "Chat Completions",
             credential_env_vars=["CHAT_COMPLETIONS_API_KEY"],
             capabilities=["tools", "streaming", "json_mode"],
             defaults={
@@ -1236,8 +1239,17 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
         return None
 
     provider = ChatCompletionsProvider(config=config, coordinator=coordinator)
-    await coordinator.mount("providers", provider, name="chat-completions")
-    logger.info("chat-completions provider mounted (base_url=%s)", base_url)
+    if provider.name != "chat-completions":
+        logger.warning(
+            "chat-completions provider mounted with custom name %r; this overrides the "
+            "coordinator's default-name remap and any configured 'instance_id' will not "
+            "take effect for this provider. See mod docs for details.",
+            provider.name,
+        )
+    await coordinator.mount("providers", provider, name=provider.name)
+    logger.info(
+        "chat-completions provider mounted (name=%s, base_url=%s)", provider.name, base_url
+    )
 
     async def cleanup() -> None:
         await provider.close()
