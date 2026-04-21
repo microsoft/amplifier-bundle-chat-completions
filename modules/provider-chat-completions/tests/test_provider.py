@@ -610,36 +610,32 @@ class TestGetInfo:
         info = provider.get_info()
         assert "CHAT_COMPLETIONS_API_KEY" in info.credential_env_vars
 
-    def test_has_all_config_fields(self):
-        """All original config fields must be present (plus any new ones)."""
+    def test_has_essential_config_fields(self):
+        """The wizard-exposed config fields are the 3 essentials.
+
+        `model` is intentionally NOT in config_fields: app-cli's wizard has a
+        dedicated model-selection phase that calls list_models() and presents
+        an interactive picker (matching the pattern in
+        amplifier-module-provider-anthropic). Declaring `model` here would
+        produce a duplicate free-text prompt before the picker.
+
+        Fields previously exposed (max_tokens, temperature, timeout,
+        max_retries, min_retry_delay, max_retry_delay, use_streaming,
+        parallel_tool_calls, filtered, raw, top_p, stop, seed) remain
+        honored at runtime via settings.yaml but are no longer prompted
+        for by the first-time provider-add wizard. See the config_fields
+        comment in __init__.py for rationale.
+        """
         expected_field_ids = {
             "api_key",
             "base_url",
-            "model",
-            "max_tokens",
-            "temperature",
-            "timeout",
-            "max_retries",
-            "min_retry_delay",
-            "max_retry_delay",
-            "use_streaming",
-            # Task 5: optional generation params
-            "top_p",
-            "stop",
-            "seed",
-            "parallel_tool_calls",
-            # Task 6: priority
             "priority",
-            # Task 7: filtered
-            "filtered",
-            # Task 8: raw
-            "raw",
         }
         provider = self._get_provider()
         info = provider.get_info()
         actual_ids = {field.id for field in info.config_fields}
-        assert expected_field_ids.issubset(actual_ids), (
-            f"Missing config fields: {expected_field_ids - actual_ids}"
+        assert actual_ids == expected_field_ids, (
+            f"config_fields drift: expected {expected_field_ids}, got {actual_ids}"
         )
 
     def test_base_url_has_env_var(self):
@@ -1932,7 +1928,9 @@ class TestPerInstanceName:
         coordinator.mount = AsyncMock()
 
         # Should warn when a custom name is used
-        with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_chat_completions"):
+        with caplog.at_level(
+            logging.WARNING, logger="amplifier_module_provider_chat_completions"
+        ):
             await module.mount(
                 coordinator, {"base_url": "http://test:8080/v1", "name": "my-azure"}
             )
@@ -1945,7 +1943,9 @@ class TestPerInstanceName:
         caplog.clear()
 
         # Should NOT warn when using the default name
-        with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_chat_completions"):
+        with caplog.at_level(
+            logging.WARNING, logger="amplifier_module_provider_chat_completions"
+        ):
             await module.mount(coordinator, {"base_url": "http://test:8080/v1"})
 
         assert not any(

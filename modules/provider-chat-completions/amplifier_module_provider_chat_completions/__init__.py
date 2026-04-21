@@ -133,7 +133,12 @@ class ChatCompletionsProvider:
             or "not-needed"
         )
 
-        self._model: str = str(self.config.get("model", "default"))
+        # Prefer `default_model` (written by amplifier-app-cli's wizard to match
+        # anthropic/openai conventions). Fall back to `model` for settings.yaml
+        # files that still use the legacy key. Finally fall back to "default".
+        self._model: str = str(
+            self.config.get("default_model") or self.config.get("model") or "default"
+        )
         self._client: openai.AsyncOpenAI | None = None
         self._timeout: float = self._config_float(
             self.config.get("timeout", 300.0), 300.0
@@ -1054,7 +1059,9 @@ class ChatCompletionsProvider:
         """
         return ProviderInfo(
             id=self.name,
-            display_name=f"Chat Completions ({self.name})" if self.name != "chat-completions" else "Chat Completions",
+            display_name=f"Chat Completions ({self.name})"
+            if self.name != "chat-completions"
+            else "Chat Completions",
             credential_env_vars=["CHAT_COMPLETIONS_API_KEY"],
             capabilities=["tools", "streaming", "json_mode"],
             defaults={
@@ -1063,12 +1070,28 @@ class ChatCompletionsProvider:
                 "temperature": 0.7,
                 "timeout": 300.0,
             },
+            # Wizard exposes only the fields a real user has to think about
+            # the first time they add this provider: api_key, base_url, priority.
+            #
+            # `model` is deliberately NOT declared here. app-cli's wizard has a
+            # dedicated "Default Model" phase (provider_config_utils.configure_provider
+            # phase 2) that calls our list_models() and presents an interactive
+            # picker of whatever the server's /v1/models returns, falling back
+            # to a free-text prompt when the server is unreachable. Declaring
+            # `model` here would produce a duplicate text prompt *before* the
+            # picker. Matches the pattern in amplifier-module-provider-anthropic.
+            #
+            # All other fields (max_tokens, temperature, timeout, max_retries,
+            # min_retry_delay, max_retry_delay, use_streaming,
+            # parallel_tool_calls, filtered, raw, top_p, stop, seed) keep their
+            # in-code defaults and remain overridable via settings.yaml for
+            # power users.
             config_fields=[
                 ConfigField(
                     id="api_key",
                     display_name="API Key",
                     field_type="secret",
-                    prompt="Enter your API key",
+                    prompt="Enter your API key (leave blank for local/keyless servers)",
                     env_var="CHAT_COMPLETIONS_API_KEY",
                     required=False,
                 ),
@@ -1082,124 +1105,12 @@ class ChatCompletionsProvider:
                     default="http://localhost:8080/v1",
                 ),
                 ConfigField(
-                    id="model",
-                    display_name="Model",
-                    field_type="text",
-                    prompt="Enter the model name to use",
-                    required=False,
-                ),
-                ConfigField(
-                    id="max_tokens",
-                    display_name="Max Tokens",
-                    field_type="text",
-                    prompt="Maximum number of tokens to generate",
-                    required=False,
-                    default="4096",
-                ),
-                ConfigField(
-                    id="temperature",
-                    display_name="Temperature",
-                    field_type="text",
-                    prompt="Sampling temperature (0.0-2.0)",
-                    required=False,
-                    default="0.7",
-                ),
-                ConfigField(
-                    id="timeout",
-                    display_name="Timeout",
-                    field_type="text",
-                    prompt="Request timeout in seconds",
-                    required=False,
-                    default="300.0",
-                ),
-                ConfigField(
-                    id="max_retries",
-                    display_name="Max Retries",
-                    field_type="text",
-                    prompt="Maximum number of retry attempts",
-                    required=False,
-                    default="3",
-                ),
-                ConfigField(
-                    id="min_retry_delay",
-                    display_name="Min Retry Delay",
-                    field_type="text",
-                    prompt="Minimum delay between retries in seconds",
-                    required=False,
-                    default="1.0",
-                ),
-                ConfigField(
-                    id="max_retry_delay",
-                    display_name="Max Retry Delay",
-                    field_type="text",
-                    prompt="Maximum delay between retries in seconds",
-                    required=False,
-                    default="30.0",
-                ),
-                ConfigField(
-                    id="use_streaming",
-                    display_name="Use Streaming",
-                    field_type="boolean",
-                    prompt="Enable streaming responses",
-                    required=False,
-                    default="true",
-                ),
-                # Task 5: Optional generation params
-                ConfigField(
-                    id="top_p",
-                    display_name="Top P",
-                    field_type="text",
-                    prompt="Nucleus sampling probability threshold (0.0-1.0)",
-                    required=False,
-                ),
-                ConfigField(
-                    id="stop",
-                    display_name="Stop Sequences",
-                    field_type="text",
-                    prompt="Stop sequence(s) for generation",
-                    required=False,
-                ),
-                ConfigField(
-                    id="seed",
-                    display_name="Random Seed",
-                    field_type="text",
-                    prompt="Random seed for reproducible generation",
-                    required=False,
-                ),
-                ConfigField(
-                    id="parallel_tool_calls",
-                    display_name="Parallel Tool Calls",
-                    field_type="boolean",
-                    prompt="Allow parallel tool calls",
-                    required=False,
-                    default="true",
-                ),
-                # Task 6: priority
-                ConfigField(
                     id="priority",
                     display_name="Priority",
                     field_type="text",
                     prompt="Provider selection priority (lower = preferred, 0 = promoted by spawn_utils)",
                     required=False,
                     default="100",
-                ),
-                # Task 7: filtered
-                ConfigField(
-                    id="filtered",
-                    display_name="Filtered Models",
-                    field_type="boolean",
-                    prompt="When true, list_models() returns only the configured model instead of all server models",
-                    required=False,
-                    default="true",
-                ),
-                # Task 8: raw
-                ConfigField(
-                    id="raw",
-                    display_name="Raw Payload",
-                    field_type="boolean",
-                    prompt="Include redacted API payloads in llm:request and llm:response events for observability",
-                    required=False,
-                    default="false",
                 ),
             ],
         )
@@ -1248,7 +1159,9 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
         )
     await coordinator.mount("providers", provider, name=provider.name)
     logger.info(
-        "chat-completions provider mounted (name=%s, base_url=%s)", provider.name, base_url
+        "chat-completions provider mounted (name=%s, base_url=%s)",
+        provider.name,
+        base_url,
     )
 
     async def cleanup() -> None:
