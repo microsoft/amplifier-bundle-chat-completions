@@ -15,7 +15,7 @@ Tests verify:
 import asyncio
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import openai
 
@@ -1844,3 +1844,111 @@ class TestRawPayload:
         assert len(response_events) >= 1
         _, payload = response_events[0]
         assert "raw" in payload, "llm:response must include 'raw' when raw=True"
+
+
+# ---------------------------------------------------------------------------
+# Per-instance config.name tests (Fix 1: honor per-instance config.name)
+# ---------------------------------------------------------------------------
+
+
+class TestPerInstanceName:
+    """Verify that config.name controls provider routing identity per-instance."""
+
+    def test_default_name_without_config_key(self):
+        """Empty config yields provider.name == 'chat-completions' (default)."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={})
+        assert provider.name == "chat-completions"
+
+    def test_name_from_config(self):
+        """config={'name': 'my-azure'} yields provider.name == 'my-azure'."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={"name": "my-azure"})
+        assert provider.name == "my-azure"
+
+    def test_get_info_reflects_self_name(self):
+        """get_info().id must equal self.name for any provider instance."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={"name": "my-azure"})
+        info = provider.get_info()
+        assert info.id == provider.name
+        assert info.id == "my-azure"
+
+    @pytest.mark.asyncio
+    async def test_mount_uses_provider_name_as_coordinator_key(self):
+        """mount() must call coordinator.mount(..., name='my-azure') when config.name is set."""
+        coordinator = MagicMock()
+        coordinator.mount = AsyncMock()
+        config = {"base_url": "http://test:8080/v1", "name": "my-azure"}
+
+        await module.mount(coordinator, config)
+
+        coordinator.mount.assert_called_once_with("providers", ANY, name="my-azure")
+
+    @pytest.mark.asyncio
+    async def test_event_payloads_reflect_self_name(self):
+        """Provider with custom name emits events with that name in the 'provider' field."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "name": "my-azure",
+                "model": "test-model",
+                "max_retries": "0",
+                "use_streaming": "false",
+            },
+            coordinator=FakeCoordinator(),
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_completion(
+            content="hello"
+        )
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        assert provider.coordinator is not None
+        hooks = provider.coordinator.hooks
+        request_events = [e for e in hooks.events if e[0] == "llm:request"]
+        assert len(request_events) >= 1, "llm:request event must be emitted"
+        _, payload = request_events[0]
+        assert payload["provider"] == "my-azure", (
+            f"Expected provider='my-azure' in llm:request payload, got {payload['provider']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_warning_logged_when_custom_name_used(self, caplog):
+        """mount() logs a WARNING when config.name != 'chat-completions'; silent otherwise."""
+        import logging
+
+        coordinator = MagicMock()
+        coordinator.mount = AsyncMock()
+
+        # Should warn when a custom name is used
+        with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_chat_completions"):
+            await module.mount(
+                coordinator, {"base_url": "http://test:8080/v1", "name": "my-azure"}
+            )
+
+        assert any(
+            r.levelno == logging.WARNING and "my-azure" in r.getMessage()
+            for r in caplog.records
+        ), "Expected a WARNING log mentioning 'my-azure' for custom provider name"
+
+        caplog.clear()
+
+        # Should NOT warn when using the default name
+        with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_chat_completions"):
+            await module.mount(coordinator, {"base_url": "http://test:8080/v1"})
+
+        assert not any(
+            r.levelno == logging.WARNING and "custom name" in r.getMessage()
+            for r in caplog.records
+        ), "Expected no custom-name warning when using the default provider name"
