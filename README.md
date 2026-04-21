@@ -14,25 +14,67 @@ This bundle provides `provider-chat-completions`, a provider module that works w
 - **text-generation-inference**
 - Any other server speaking the OpenAI Chat Completions wire format
 
-## Usage
+## Installation (end users)
 
-Include this bundle in your Amplifier configuration:
+If you have an OpenAI-compatible server running (llama-server, vLLM, etc.) and
+just want to point Amplifier at it, run the following from a fresh shell:
+
+```bash
+# 1. Install Amplifier itself (skip if already installed)
+uv tool install git+https://github.com/microsoft/amplifier@main
+
+# 2. Register this bundle
+amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-chat-completions@main
+
+# 3. Install the provider module so it shows up in the provider picker.
+#    This step is required -- `bundle add` alone does not install the module.
+amplifier module add provider-chat-completions \
+  --source git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#subdirectory=modules/provider-chat-completions
+
+# 4. Configure the provider (base_url, model, api_key) interactively.
+#    "Chat Completions" will appear in the list after step 3.
+amplifier provider manage
+
+# 5. Activate a functional bundle. This bundle is provider-only -- it has no
+#    tools, agents, or orchestrator -- so you need a base bundle on top.
+#    Pick one:
+#      foundation             -- the full default stack
+#      exp-lean-foundation    -- a minimal, token-efficient stack
+amplifier bundle add git+https://github.com/microsoft/amplifier-foundation@main#subdirectory=experiments/exp-lean/exp-lean-foundation.md
+amplifier bundle use exp-lean-foundation
+
+# 6. Start a session
+amplifier
+```
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `CHAT_COMPLETIONS_BASE_URL` | Server endpoint (overrides `base_url` config) |
+| `CHAT_COMPLETIONS_API_KEY` | API key (overrides `api_key` config) |
+
+## Composition (bundle authors)
+
+If you are building your own bundle and want to include `chat-completions` as
+a dependency, compose via YAML includes -- users of your bundle do not need to
+run the `bundle add` / `module add` steps above.
+
+Include the whole bundle:
 
 ```yaml
 includes:
   - bundle: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main
 ```
 
-Or include the behavior directly:
+Or include just the behavior:
 
 ```yaml
 includes:
   - bundle: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#behaviors/chat-completions
 ```
 
-### Configuration
-
-In your behavior YAML:
+Then configure the provider in your own behavior YAML:
 
 ```yaml
 providers:
@@ -42,13 +84,6 @@ providers:
       base_url: http://localhost:8080/v1
       model: gemma26-long
 ```
-
-### Environment Variables
-
-| Variable | Purpose |
-|----------|---------|
-| `CHAT_COMPLETIONS_BASE_URL` | Server endpoint (overrides `base_url` config) |
-| `CHAT_COMPLETIONS_API_KEY` | API key (overrides `api_key` config) |
 
 ## Contributing
 
