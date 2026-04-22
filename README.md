@@ -1,89 +1,125 @@
 # amplifier-bundle-chat-completions
 
-Amplifier provider bundle for any server implementing the OpenAI Chat Completions API (`/v1/chat/completions`).
+> [!WARNING]
+> **DEPRECATED — This bundle is scheduled for retirement.**
+>
+> The `provider-chat-completions` module has been promoted to its own
+> standalone repository:
+> **[amplifier-module-provider-chat-completions](https://github.com/microsoft/amplifier-module-provider-chat-completions)**
+>
+> An upcoming Amplifier CLI release will pre-install it alongside the other
+> well-known providers (anthropic, openai, azure-openai, gemini, ollama,
+> vllm, github-copilot). Once that ships, you will no longer need this
+> bundle — or any manual module registration — to use the provider.
+>
+> Until then, use the standalone module directly. See
+> **[Migration](#migration)** below.
+>
+> This repository will remain in place for a short grace period so existing
+> users are not broken immediately, then will be retired (archived on GitHub).
 
-## Overview
+## What Changed?
 
-This bundle provides `provider-chat-completions`, a provider module that works with:
+Before: the `provider-chat-completions` Python module was hosted *inside* this
+bundle at `modules/provider-chat-completions/`. Users had to `amplifier bundle
+add` this repo AND `amplifier module add --source ...#subdirectory=...` to get
+the provider available.
 
-- **llama-server** (llama.cpp)
-- **vLLM** (Chat Completions mode)
-- **SGLang**
-- **LocalAI**
-- **LM Studio**
-- **text-generation-inference**
-- Any other server speaking the OpenAI Chat Completions wire format
+After: the module lives in its own top-level repository
+(`amplifier-module-provider-chat-completions`) and is or will be pre-installed
+by the Amplifier CLI, matching the shape of every other well-known provider.
+No bundle required.
 
-## Installation (end users)
+**Transparent behavior-level redirect during the grace period:** the
+`behaviors/chat-completions` file in this bundle has been updated to pull the
+provider from its new standalone location. If your bundle still `includes:`
+this behavior, it will continue to work — you will silently pick up the
+relocated module. Migrate to the new source URL at your convenience per the
+[Bundle authors](#bundle-authors) section below.
 
-If you have an OpenAI-compatible server running (llama-server, vLLM, etc.) and
-just want to point Amplifier at it, run the following from a fresh shell:
+## Migration
+
+### End users
+
+If you previously installed this bundle, remove it and switch to the
+standalone module:
 
 ```bash
-# 1. Install Amplifier itself (skip if already installed)
-uv tool install git+https://github.com/microsoft/amplifier@main
+# 1. Remove the bundle (use whichever form matches how you added it):
+amplifier bundle remove chat-completions
+# or, if you added by URL:
+amplifier bundle remove git+https://github.com/microsoft/amplifier-bundle-chat-completions@main
 
-# 2. Register this bundle
-amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-chat-completions@main
+# 2. REQUIRED if you ever ran the old `module add` incantation:
+#    this step clears the frozen `#subdirectory=...` URL from your
+#    ~/.amplifier/settings.yaml. Skipping it means your CLI will keep
+#    resolving to the (soon-to-be-retired) bundle subdirectory instead
+#    of the new standalone module — even after this repo is archived.
+amplifier module remove provider-chat-completions
 
-# 3. Install the provider module so it shows up in the provider picker.
-#    This step is required -- `bundle add` alone does not install the module.
+# 3. Install the standalone module directly:
 amplifier module add provider-chat-completions \
-  --source git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#subdirectory=modules/provider-chat-completions
+  --source git+https://github.com/microsoft/amplifier-module-provider-chat-completions@main
 
-# 4. Configure the provider (base_url, model, api_key) interactively.
-#    "Chat Completions" will appear in the list after step 3.
-amplifier provider manage
-
-# 5. Activate a functional bundle. This bundle is provider-only -- it has no
-#    tools, agents, or orchestrator -- so you need a base bundle on top.
-#    Pick one:
-#      foundation             -- the full default stack
-#      exp-lean-foundation    -- a minimal, token-efficient stack
-amplifier bundle add git+https://github.com/microsoft/amplifier-foundation@main#subdirectory=experiments/exp-lean/exp-lean-foundation.md
-amplifier bundle use exp-lean-foundation
-
-# 6. Start a session
-amplifier
+# 4. Configure as normal:
+amplifier provider add
+# Select "OpenAI-Compatible" (or "Chat Completions" on older CLI releases)
+# and supply your base_url + model name.
 ```
 
-### Environment Variables
+Once an Amplifier CLI release that pre-installs `provider-chat-completions`
+lands, step 3 becomes unnecessary — a plain `amplifier update` will be enough.
+See [Amplifier release notes](https://github.com/microsoft/amplifier/releases)
+for the version that adds it.
 
-| Variable | Purpose |
-|----------|---------|
-| `CHAT_COMPLETIONS_BASE_URL` | Server endpoint (overrides `base_url` config) |
-| `CHAT_COMPLETIONS_API_KEY` | API key (overrides `api_key` config) |
+### Bundle authors
 
-## Composition (bundle authors)
+If your bundle currently composes this one, update your source URL:
 
-If you are building your own bundle and want to include `chat-completions` as
-a dependency, compose via YAML includes -- users of your bundle do not need to
-run the `bundle add` / `module add` steps above.
-
-Include the whole bundle:
-
-```yaml
-includes:
-  - bundle: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main
+```diff
+  providers:
+    - module: provider-chat-completions
+-     source: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#subdirectory=modules/provider-chat-completions
++     source: git+https://github.com/microsoft/amplifier-module-provider-chat-completions@main
 ```
 
-Or include just the behavior:
+Or, once your consumers are on an Amplifier CLI release that pre-installs the
+provider, drop the `source:` line entirely — the CLI's
+`DEFAULT_PROVIDER_SOURCES` will resolve it.
 
-```yaml
-includes:
-  - bundle: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#behaviors/chat-completions
-```
+If your bundle currently composes `behaviors/chat-completions` from this repo
+via `includes:`, it will keep working during the grace period (thanks to the
+transparent redirect described above) but will break when this repo is
+archived. Update `includes:` to point at the new standalone module's source
+URL directly, or compose the provider explicitly in your own `providers:`
+block.
 
-Then configure the provider in your own behavior YAML:
+### If you do nothing
 
-```yaml
-providers:
-  - module: provider-chat-completions
-    source: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#subdirectory=modules/provider-chat-completions
-    config:
-      base_url: http://localhost:8080/v1
-      model: gemma26-long
-```
+During the grace period: everything keeps working. The bundle still resolves,
+the behavior YAML now points at the new standalone module, and existing user
+installations continue to function.
+
+After retirement (archival): `git clone` / git-based installs of this repo
+will fail. Anyone who didn't migrate loses access to the provider until they
+either (a) upgrade to an Amplifier CLI release that pre-installs it, or
+(b) runs the manual `amplifier module add` command above pointing at the
+standalone repo.
+
+## Timeline
+
+This repository will remain available during a short grace period while
+consumers migrate. Specific retirement date will be announced on the
+[new standalone repo](https://github.com/microsoft/amplifier-module-provider-chat-completions),
+but plan on migrating within the next release cycle or two. **Do not treat
+this as a stable long-term URL.**
+
+## Configuration Reference
+
+Configuration is unchanged from the bundled version — same module, same
+config keys. See the standalone repo's
+[README](https://github.com/microsoft/amplifier-module-provider-chat-completions#configuration)
+for the full reference.
 
 ## Contributing
 
@@ -106,6 +142,6 @@ contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additio
 
 This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft
 trademarks or logos is subject to and must follow
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
+[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.

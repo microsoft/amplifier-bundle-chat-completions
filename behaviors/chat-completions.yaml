@@ -1,8 +1,8 @@
 bundle:
   name: chat-completions-behavior
-  version: 1.0.0
-  description: Provider for OpenAI Chat Completions API compatible servers
+  version: 1.0.1
+  description: "DEPRECATED — kept alive for existing consumers while they migrate. Source URL now points at the standalone amplifier-module-provider-chat-completions repo (transparent redirect). Migrate to that URL directly or rely on the CLI's pre-installed provider once it lands."
 
 providers:
   - module: provider-chat-completions
-    source: git+https://github.com/microsoft/amplifier-bundle-chat-completions@main#subdirectory=modules/provider-chat-completions
+    source: git+https://github.com/microsoft/amplifier-module-provider-chat-completions@main
