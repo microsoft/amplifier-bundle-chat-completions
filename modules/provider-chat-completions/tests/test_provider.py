@@ -1952,3 +1952,201 @@ class TestPerInstanceName:
             r.levelno == logging.WARNING and "custom name" in r.getMessage()
             for r in caplog.records
         ), "Expected no custom-name warning when using the default provider name"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: cache_read_tokens extraction from prompt_tokens_details
+# ---------------------------------------------------------------------------
+
+
+class TestCacheReadTokens:
+    """Tests for cache_read_tokens extraction from prompt_tokens_details."""
+
+    def _get_provider(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(
+            config={"model": "test-model", "use_streaming": "false", "max_retries": "0"}
+        )
+
+    def _make_provider_streaming(self):
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        return ChatCompletionsProvider(
+            config={"model": "test-model", "use_streaming": "true", "max_retries": "0"}
+        )
+
+    def _make_chunk(self, content=None, finish_reason=None, usage=None):
+        """Build a minimal mock streaming chunk."""
+        delta = MagicMock()
+        delta.content = content
+        delta.tool_calls = None
+        delta.reasoning_content = None
+
+        choice = MagicMock()
+        choice.delta = delta
+        choice.finish_reason = finish_reason
+
+        chunk = MagicMock()
+        chunk.choices = [choice]
+        chunk.usage = usage
+        return chunk
+
+    # --- _build_response (non-streaming) ---
+
+    def test_build_response_extracts_cache_read_tokens_from_details(self):
+        """cache_read_tokens is populated from usage.prompt_tokens_details.cached_tokens."""
+        provider = self._get_provider()
+        response = _make_mock_completion(
+            content="hello", prompt_tokens=20, completion_tokens=5, total_tokens=25
+        )
+        mock_details = MagicMock()
+        mock_details.cached_tokens = 15
+        response.usage.prompt_tokens_details = mock_details
+
+        result = provider._build_response(response)
+
+        assert result.usage is not None
+        assert result.usage.cache_read_tokens == 15
+
+    def test_build_response_cache_read_tokens_none_when_zero(self):
+        """cache_read_tokens is None when cached_tokens is 0 (falsy)."""
+        provider = self._get_provider()
+        response = _make_mock_completion(content="hello")
+        mock_details = MagicMock()
+        mock_details.cached_tokens = 0
+        response.usage.prompt_tokens_details = mock_details
+
+        result = provider._build_response(response)
+
+        assert result.usage is not None
+        assert result.usage.cache_read_tokens is None
+
+    def test_build_response_cache_read_tokens_none_when_no_details(self):
+        """cache_read_tokens is None when prompt_tokens_details is None."""
+        provider = self._get_provider()
+        response = _make_mock_completion(content="hello")
+        response.usage.prompt_tokens_details = None
+
+        result = provider._build_response(response)
+
+        assert result.usage is not None
+        assert result.usage.cache_read_tokens is None
+
+    # --- streaming path ---
+
+    @pytest.mark.asyncio
+    async def test_streaming_extracts_cache_read_tokens_from_usage_details(self):
+        """Streaming path populates cache_read_tokens from usage.prompt_tokens_details.cached_tokens."""
+        provider = self._make_provider_streaming()
+        mock_client = MagicMock()
+        provider._client = mock_client
+
+        usage_mock = MagicMock()
+        usage_mock.prompt_tokens = 20
+        usage_mock.completion_tokens = 5
+        usage_mock.total_tokens = 25
+        mock_details = MagicMock()
+        mock_details.cached_tokens = 10
+        usage_mock.prompt_tokens_details = mock_details
+
+        chunks = [
+            self._make_chunk(content="hello"),
+            self._make_chunk(content=None, finish_reason="stop", usage=usage_mock),
+        ]
+
+        async def async_chunks():
+            for chunk in chunks:
+                yield chunk
+
+        mock_client.chat.completions.create = AsyncMock(return_value=async_chunks())
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        result = await provider.complete(request)
+
+        assert result.usage is not None
+        assert result.usage.cache_read_tokens == 10
+
+    @pytest.mark.asyncio
+    async def test_streaming_cache_read_tokens_none_when_details_absent(self):
+        """Streaming path sets cache_read_tokens=None when prompt_tokens_details is None."""
+        provider = self._make_provider_streaming()
+        mock_client = MagicMock()
+        provider._client = mock_client
+
+        usage_mock = MagicMock()
+        usage_mock.prompt_tokens = 10
+        usage_mock.completion_tokens = 3
+        usage_mock.total_tokens = 13
+        usage_mock.prompt_tokens_details = None
+
+        chunks = [
+            self._make_chunk(content="hi"),
+            self._make_chunk(content=None, finish_reason="stop", usage=usage_mock),
+        ]
+
+        async def async_chunks():
+            for chunk in chunks:
+                yield chunk
+
+        mock_client.chat.completions.create = AsyncMock(return_value=async_chunks())
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hello")],
+            model="test-model",
+        )
+        result = await provider.complete(request)
+
+        assert result.usage is not None
+        assert result.usage.cache_read_tokens is None
+
+    # --- ordering fix: llm:response event includes cache_read_tokens ---
+
+    @pytest.mark.asyncio
+    async def test_llm_response_event_includes_cache_read_tokens_when_nonzero(self):
+        """llm:response event usage dict includes cache_read_tokens when non-zero."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(
+            config={
+                "model": "test-model",
+                "use_streaming": "false",
+                "max_retries": "0",
+            },
+            coordinator=FakeCoordinator(),
+        )
+        mock_client = AsyncMock()
+        provider._client = mock_client
+
+        completion = _make_mock_completion(
+            content="hello",
+            prompt_tokens=20,
+            completion_tokens=5,
+            total_tokens=25,
+        )
+        mock_details = MagicMock()
+        mock_details.cached_tokens = 15
+        completion.usage.prompt_tokens_details = mock_details
+        mock_client.chat.completions.create.return_value = completion
+
+        request = ChatRequest(
+            messages=[Message(role="user", content="hi")],
+            model="test-model",
+        )
+        await provider.complete(request)
+
+        hooks = provider.coordinator.hooks
+        response_events = [
+            e
+            for e in hooks.events
+            if e[0] == "llm:response" and e[1].get("status") != "error"
+        ]
+        assert len(response_events) >= 1
+        _, payload = response_events[0]
+        usage = payload["usage"]
+        assert usage.get("cache_read_tokens") == 15, (
+            f"Expected cache_read_tokens=15 in llm:response usage, got {usage}"
+        )
